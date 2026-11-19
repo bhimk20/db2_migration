@@ -21,10 +21,12 @@ app.py               Streamlit entry point: page config, sidebar, navigation
 app_pages/
   home.py            Upload, application lookup, sizing recommendation
   research.py        Guided lessons + full research reference
+  db2_metrics.py     DB2 metrics collection, analysis and Azure sizing
 core/
   azure_recommender.py  Sizing engine (SKU catalog, IOPS caps, rules)
   app_lookup.py         Application -> server lookup and Excel report
   dataset_loader.py     File loading and schema detection
+  db2_metrics.py        Db2 collector (docker exec or ibm_db) and analyzer
   path_manager.py       Saved local paths (stored in ~/.azure_migration_assistant/)
   schemas.py            Dataset schema definitions
   sample_data.py        Synthetic sample data generator
@@ -54,6 +56,10 @@ For Windows and macOS together, use GitHub Actions: run **Build executables** fr
 
 The bundle contains the code, `docs/` and the theme only. Real exports in `samples/` are not included, and each user's saved file paths stay in their own home folder.
 
+## DB2 metrics
+
+The **DB2 metrics** page runs read-only queries (`MON_GET_*`, `ADMIN_GET_TAB_INFO`, `SYSCAT.*`) against a Db2 database, takes counter snapshots to derive peak CPU, IOPS and connections, lists migration risks (XML, VECTOR, MDC, routines) and feeds the sizing engine. Connect through a local Docker container (no driver needed) or over TCP with `pip install ibm_db`. The user needs SYSMON or DBADM. Short samples are a demo only: size production from a representative busy window.
+
 ## Azure sizing rules
 
 Rules follow `docs/azure_research.md` (Canada Central, Flexible Server, v5 SKUs):
@@ -62,3 +68,6 @@ Rules follow `docs/azure_research.md` (Canada Central, Flexible Server, v5 SKUs)
 - **Non-production:** Burstable, dev/test only. No HA.
 - **Advanced inputs:** peak CPU %, hot working set, data growth, peak IOPS and connection counts replace default estimates with your measurements.
 - **Storage:** 12 months of growth +30% MVCC/WAL headroom, 32 GiB minimum. IOPS are the lower of the disk's and the VM's limit.
+
+
+docker run -itd --name db2 --cap-add=IPC_LOCK --cap-add=IPC_OWNER --shm-size=1g -e LICENSE=accept -e DB2INST1_PASSWORD=db2inst1 -e DBNAME=SampleDB -p 50000:50000 icr.io/db2_community/db2
