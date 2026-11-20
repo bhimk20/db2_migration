@@ -29,13 +29,22 @@ $WorkDir = if ($env:WORK_DIR) { $env:WORK_DIR } else { '/database/gsdb_setup' } 
 $ArchiveUrl = if ($env:ARCHIVE_URL) { $env:ARCHIVE_URL } else { 'https://public.dhe.ibm.com/software/data/sample/GSDB_DB2_LUW_ZOS_v2r3.zip' }
 $Archive = $ArchiveUrl.Substring($ArchiveUrl.LastIndexOf('/') + 1)
 
-# Run a docker command with its stderr discarded; returns the output and the exit code.
+# Container CLI: env DB2_CONTAINER_CLI, else docker, else wslc (WSL container CLI).
+$Cli = $env:DB2_CONTAINER_CLI
+if (-not $Cli) {
+    foreach ($c in 'docker', 'wslc') {
+        if (Get-Command $c -ErrorAction SilentlyContinue) { $Cli = $c; break }
+    }
+}
+if (-not $Cli) { throw 'Neither docker nor wslc was found on PATH' }
+
+# Run a container CLI command with its stderr discarded; returns the output and the exit code.
 function Get-DockerOutput {
     param([string[]]$Arguments)
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $out = & docker @Arguments 2>$null
+        $out = & $Cli @Arguments 2>$null
     } finally {
         $ErrorActionPreference = $prev
     }
@@ -52,7 +61,7 @@ function Invoke-ContainerBash {
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'   # native stderr lines must not abort the script
     try {
-        $lines = $lf | docker exec -i $Container bash -s 2>&1 | Tee-Object -FilePath $LogFile -Append
+        $lines = $lf | & $Cli exec -i $Container bash -s 2>&1 | Tee-Object -FilePath $LogFile -Append
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prev
@@ -71,10 +80,10 @@ function Expand-Template {
 if ($Database -notmatch '^[A-Za-z][A-Za-z0-9_]{0,7}$') {
     throw "Invalid Db2 database name: $Database (max 8 chars)"
 }
-if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'docker was not found on PATH' }
 
-$inspect = Get-DockerOutput @('inspect', '-f', '{{.State.Running}}', $Container)
-if ($inspect.Code -ne 0 -or ("$($inspect.Output)").Trim() -ne 'true') {
+# `exec true` works on any docker-compatible CLI (wslc may lack `inspect`) and fails if not running.
+$probe = Get-DockerOutput @('exec', $Container, 'true')
+if ($probe.Code -ne 0) {
     throw "Container '$Container' is not running"
 }
 
@@ -123,5 +132,5 @@ su - '__INSTANCE_USER__' -c "db2 -x connect to '__DATABASE__' >/dev/null && db2 
 $verifyOutput = Invoke-ContainerBash (Expand-Template $template3 $values)
 $verifyOutput | ForEach-Object { Write-Host $_ }
 
-Write-Host "Done. Point the DB2 assessment page at database=$Database (docker container=$Container)."
-Write-Host "Optional cleanup: docker exec $Container rm -rf $WorkDir"
+Write-Host "Done. Point the DB2 assessment page at database=$Database ($Cli container=$Container)."
+Write-Host "Optional cleanup: $Cli exec $Container rm -rf $WorkDir"

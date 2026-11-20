@@ -5,7 +5,8 @@ Collects sizing inputs from a Db2 database (read-only queries) and turns them in
 arguments of `azure_recommender.recommend_azure_postgresql`, plus a list of migration findings.
 
 Two ways to reach Db2:
-  - docker mode: `docker exec <container> su - <instance> -c "db2 ..."` (no driver needed)
+  - container mode: `docker exec <container> su - <instance> -c "db2 ..."` (no driver needed). Uses docker,
+    or `wslc` (WSL container CLI) when docker is unavailable; override with env DB2_CONTAINER_CLI
   - driver mode: `ibm_db_dbi` over TCP (optional dependency; imported lazily)
 
 Counters from MON_GET_* are cumulative since database activation, so `collect_sampled` takes
@@ -15,8 +16,10 @@ Catalog collectors (`collect_static`, `collect_objects`) cover every user schema
 grouped by schema (`*_by_schema` dicts and a leading `schema` column); system schemas are skipped (`USER_SCHEMA_SQL`).
 """
 
+import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -57,9 +60,33 @@ class Db2Error(RuntimeError):
 
 
 # ---------------------------------------------------------------- execution
+_CLI_CANDIDATES = ("docker", "wslc")
+_cli_cache: Optional[str] = None
+
+
+def container_cli() -> str:
+    """Container CLI to use: env DB2_CONTAINER_CLI, else the first of docker / wslc that is on PATH and answers
+    `ps`. Falls back to the first one on PATH (or docker) so errors name a real command."""
+    global _cli_cache
+    override = os.environ.get("DB2_CONTAINER_CLI", "").strip()
+    if override:
+        return override
+    if _cli_cache:
+        return _cli_cache
+    on_path = [c for c in _CLI_CANDIDATES if shutil.which(c)]
+    for cli in on_path:
+        try:
+            if subprocess.run([cli, "ps"], capture_output=True, timeout=15).returncode == 0:
+                _cli_cache = cli
+                return cli
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return on_path[0] if on_path else _CLI_CANDIDATES[0]
+
+
 def _run_docker(src: Db2Source, sql: str) -> List[List[str]]:
     script = f"db2 connect to {src.database} >/dev/null && db2 -x {shlex.quote(sql)}"
-    cmd = ["docker", "exec", src.container, "su", "-", src.instance_user, "-c", script]
+    cmd = [container_cli(), "exec", src.container, "su", "-", src.instance_user, "-c", script]
     proc = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=120)
     out = proc.stdout.strip()
     # db2 -x exit code 1 = "no rows"; >=2 = error
@@ -72,7 +99,7 @@ def _run_driver(src: Db2Source, sql: str) -> List[List[str]]:
     try:
         import ibm_db_dbi  # type: ignore
     except ImportError as exc:  # pragma: no cover
-        raise Db2Error("ibm_db is not installed (pip install ibm_db) and no docker container was given") from exc
+        raise Db2Error("ibm_db is not installed (pip install ibm_db) and no container was given") from exc
     dsn = (f"DATABASE={src.database};HOSTNAME={src.host};PORT={src.port};PROTOCOL=TCPIP;"
            f"UID={src.user};PWD={src.password};")
     conn = ibm_db_dbi.connect(dsn, "", "")
@@ -206,7 +233,7 @@ def _routine_effort(language: str, lines: float, flags: int) -> str:
 def list_containers() -> List[str]:
     """Running docker containers whose image looks like Db2 (empty when docker is missing or stopped)."""
     try:
-        proc = subprocess.run(["docker", "ps", "--format", "{{.Names}}|{{.Image}}"],
+        proc = subprocess.run([container_cli(), "ps", "--format", "{{.Names}}|{{.Image}}"],
                               capture_output=True, encoding="utf-8", errors="replace", timeout=10)
     except (OSError, subprocess.SubprocessError):
         return []
@@ -219,13 +246,13 @@ def list_databases(src: Db2Source) -> List[str]:
     if not src.container:
         return []
     src.validate()
-    cmd = ["docker", "exec", src.container, "su", "-", src.instance_user, "-c", "db2 list db directory"]
+    cmd = [container_cli(), "exec", src.container, "su", "-", src.instance_user, "-c", "db2 list db directory"]
     try:
         proc = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:
         raise Db2Error(f"Cannot reach container '{src.container}': {exc}") from exc
     if proc.returncode >= 2 and not proc.stdout.strip():
-        raise Db2Error((proc.stderr or "docker exec failed").strip()[:300])
+        raise Db2Error((proc.stderr or f"{container_cli()} exec failed").strip()[:300])
     names, alias, local = [], None, False
     for line in proc.stdout.splitlines() + ["Database 0 entry:"]:
         key, _, val = line.partition("=")
@@ -350,7 +377,7 @@ def detect_cpu_limit(src: Db2Source) -> Optional[float]:
               "cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null; echo '--'; "
               "cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null")
     try:
-        proc = subprocess.run(["docker", "exec", src.container, "sh", "-c", script],
+        proc = subprocess.run([container_cli(), "exec", src.container, "sh", "-c", script],
                               capture_output=True, encoding="utf-8", errors="replace", timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
