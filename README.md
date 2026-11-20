@@ -21,7 +21,8 @@ app.py               Streamlit entry point: page config, sidebar, navigation
 app_pages/
   home.py            Upload, application lookup, sizing recommendation
   research.py        Guided lessons + full research reference
-  db2_metrics.py     DB2 metrics collection, analysis and Azure sizing
+  db2_explorer.py    DB2 object inventory (tables, views, stored procedures)
+  db2_assessment.py  DB2 sizing metrics, findings and Azure recommendation
 core/
   azure_recommender.py  Sizing engine (SKU catalog, IOPS caps, rules)
   app_lookup.py         Application -> server lookup and Excel report
@@ -56,9 +57,9 @@ For Windows and macOS together, use GitHub Actions: run **Build executables** fr
 
 The bundle contains the code, `docs/` and the theme only. Real exports in `samples/` are not included, and each user's saved file paths stay in their own home folder.
 
-## DB2 metrics
+## DB2
 
-The **DB2 metrics** page runs read-only queries (`MON_GET_*`, `ADMIN_GET_TAB_INFO`, `SYSCAT.*`) against a Db2 database, takes counter snapshots to derive peak CPU, IOPS and connections, lists migration risks (XML, VECTOR, MDC, routines) and feeds the sizing engine. Connect through a local Docker container (no driver needed) or over TCP with `pip install ibm_db`. The user needs SYSMON or DBADM. Short samples are a demo only: size production from a representative busy window.
+Two pages share one connection. **DB2 explorer** lists the tables (keys, indexes), views and stored procedures/functions of a schema, with a rough rewrite effort per routine. **DB2 assessment** runs read-only queries (`MON_GET_*`, `ADMIN_GET_TAB_INFO`, `SYSCAT.*`) against a Db2 database, takes counter snapshots to derive peak CPU, IOPS and connections, lists migration risks (XML, VECTOR, MDC, routines) and feeds the sizing engine. For a ready-made test database, `scripts/setup_gsdb.sh [container] [database]` installs IBM's Great Outdoors sample (GS_DB; use schema GOSALES or GOSALESDW). Connect through a local Docker container (no driver needed) or over TCP with `pip install ibm_db`. The user needs SYSMON or DBADM. Short samples are a demo only: size production from a representative busy window.
 
 ## Azure sizing rules
 

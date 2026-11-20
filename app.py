@@ -47,7 +47,8 @@ with st.sidebar:
 # ---------------- NAVIGATION ----------------
 pg = st.navigation([
     st.Page("app_pages/home.py", title="Home", icon=":material/home:", default=True),
-    st.Page("app_pages/db2_metrics.py", title="DB2 metrics", icon=":material/monitoring:"),
+    st.Page("app_pages/db2_explorer.py", title="DB2 explorer", icon=":material/database:"),
+    st.Page("app_pages/db2_assessment.py", title="DB2 assessment", icon=":material/monitoring:"),
     st.Page("app_pages/research.py", title="Research & guide", icon=":material/menu_book:"),
 ])
 pg.run()

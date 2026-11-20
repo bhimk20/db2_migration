@@ -149,6 +149,126 @@ def collect_static(src: Db2Source) -> Dict[str, Any]:
     return out
 
 
+# ---------------------------------------------------------------- object inventory
+_ROUTINE_FLAGS = {  # Db2 SQL PL features that need manual rewrite for PL/pgSQL
+    "cursor": "DECLARE%CURSOR",
+    "handler": "HANDLER FOR",
+    "dynamic_sql": "PREPARE ",
+    "signal": "SIGNAL ",
+    "diagnostics": "GET DIAGNOSTICS",
+    "temp_table": "DECLARE GLOBAL TEMPORARY",
+}
+
+
+def _routine_effort(language: str, lines: float, flags: int) -> str:
+    """Rough rewrite effort for a routine: High / Medium / Low."""
+    if language.strip().upper() != "SQL" or flags >= 2 or lines > 200:
+        return "High"
+    if flags == 1 or lines > 30:
+        return "Medium"
+    return "Low"
+
+
+def list_containers() -> List[str]:
+    """Running docker containers whose image looks like Db2 (empty when docker is missing or stopped)."""
+    try:
+        proc = subprocess.run(["docker", "ps", "--format", "{{.Names}}|{{.Image}}"],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = [line.split("|", 1) for line in proc.stdout.splitlines() if "|" in line]
+    return [name for name, image in rows if "db2" in image.lower() or "db2" in name.lower()]
+
+
+def list_databases(src: Db2Source) -> List[str]:
+    """Local databases cataloged in the Db2 instance (docker mode). Over TCP Db2 cannot list them: returns []."""
+    if not src.container:
+        return []
+    src.validate()
+    cmd = ["docker", "exec", src.container, "su", "-", src.instance_user, "-c", "db2 list db directory"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise Db2Error(f"Cannot reach container '{src.container}': {exc}") from exc
+    if proc.returncode >= 2 and not proc.stdout.strip():
+        raise Db2Error((proc.stderr or "docker exec failed").strip()[:300])
+    names, alias, local = [], None, False
+    for line in proc.stdout.splitlines() + ["Database 0 entry:"]:
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if key == "Database alias":
+            alias = val
+        elif key == "Directory entry type":
+            local = val.lower() == "indirect"
+        elif line.startswith("Database ") and line.rstrip().endswith("entry:"):
+            if alias and local and alias not in names:
+                names.append(alias)
+            alias, local = None, False
+    return sorted(names)
+
+
+def list_schemas(src: Db2Source) -> List[str]:
+    """Non-system schemas that own at least one table, view or routine."""
+    rows = run_sql(src, ["schemaname"],
+                   "from syscat.schemata where schemaname not like 'SYS%' and schemaname not in "
+                   "('NULLID','SQLJ','DB2GSE','IBM_RTMON','ADMIN') and schemaname not like 'IBM%' "
+                   "order by schemaname")
+    return [r[0].strip() for r in rows]
+
+
+def collect_objects(src: Db2Source) -> Dict[str, pd.DataFrame]:
+    """Inventory of the schema: tables (structure), views and routines (procedures / functions).
+    Catalog queries only. Source text is not fetched, just its length and migration-relevant flags."""
+    s = src.schema.upper()
+    out: Dict[str, pd.DataFrame] = {}
+
+    t = run_sql(src, [
+        "t.tabname", "t.colcount", "coalesce(t.card,-1)", "t.tableorg",
+        f"(select count(*) from syscat.keycoluse k join syscat.tabconst c on c.constname=k.constname and "
+        f"c.tabschema=k.tabschema and c.tabname=k.tabname where c.tabschema=t.tabschema and c.tabname=t.tabname and c.type='P')",
+        f"(select count(*) from syscat.tabconst c where c.tabschema=t.tabschema and c.tabname=t.tabname and c.type='F')",
+        f"(select count(*) from syscat.indexes i where i.tabschema=t.tabschema and i.tabname=t.tabname)",
+        f"(select count(*) from syscat.triggers g where g.tabschema=t.tabschema and g.tabname=t.tabname)",
+    ], f"from syscat.tables t where t.type='T' and t.tabschema='{s}' order by t.tabname")
+    tdf = pd.DataFrame(t, columns=["table", "columns", "rows", "organization", "pk_columns", "foreign_keys",
+                                   "indexes", "triggers"])
+    for c in ("columns", "rows", "pk_columns", "foreign_keys", "indexes", "triggers"):
+        tdf[c] = pd.to_numeric(tdf[c], errors="coerce").fillna(0).astype(int)
+    out["tables"] = tdf
+
+    v = run_sql(src, [
+        "v.viewname", "v.valid", "coalesce(length(v.text),0)",
+        "(select count(*) from syscat.tabdep d where d.tabschema=v.viewschema and d.tabname=v.viewname)",
+    ], f"from syscat.views v where v.viewschema='{s}' order by v.viewname")
+    vdf = pd.DataFrame(v, columns=["view", "valid", "text_length", "dependencies"])
+    for c in ("text_length", "dependencies"):
+        vdf[c] = pd.to_numeric(vdf[c], errors="coerce").fillna(0).astype(int)
+    out["views"] = vdf
+
+    body = "upper(cast(substr(r.text,1,32000) as varchar(32000)))"
+    flag_exprs = [f"case when {body} like '%{pat}%' then 1 else 0 end" for pat in _ROUTINE_FLAGS.values()]
+    r = run_sql(src, ["r.routinename", "r.routinetype", "r.language", "r.parm_count",
+                      "coalesce(length(r.text),0)", *flag_exprs],
+                f"from syscat.routines r where r.routineschema='{s}' and r.routinetype in ('P','F') "
+                f"order by r.routinename")
+    rdf = pd.DataFrame(r, columns=["routine", "type", "language", "parameters", "text_length", *_ROUTINE_FLAGS])
+    rdf["type"] = rdf["type"].map({"P": "Procedure", "F": "Function"}).fillna(rdf["type"])
+    for c in ("parameters", "text_length", *_ROUTINE_FLAGS):
+        rdf[c] = pd.to_numeric(rdf[c], errors="coerce").fillna(0).astype(int)
+    rdf["db2_features"] = rdf[list(_ROUTINE_FLAGS)].sum(axis=1)
+    # ~60 characters per line of SQL PL
+    rdf["effort"] = [_routine_effort(l, n / 60.0, f) for l, n, f in
+                     zip(rdf["language"], rdf["text_length"], rdf["db2_features"])]
+    out["routines"] = rdf
+
+    cnt = {}
+    for key, tail in (("triggers", f"from syscat.triggers where trigschema='{s}'"),
+                      ("sequences", f"from syscat.sequences where seqschema='{s}' and seqtype='S'")):
+        cnt[key] = int(_f(run_sql(src, ["count(*)"], tail)[0][0]))
+    out["counts"] = cnt  # type: ignore[assignment]
+    return out
+
+
 # ---------------------------------------------------------------- sampling
 _DB_COLS = ["total_cpu_time", "total_app_commits", "total_app_rollbacks", "rows_read", "rows_returned",
             "direct_reads", "direct_writes", "log_disk_wait_time"]
@@ -261,7 +381,7 @@ def collect_sampled(src: Db2Source, cpus: float, interval_s: int = 30, samples: 
 
 # ---------------------------------------------------------------- analysis
 def analyze(static: Dict[str, Any], sampled: Optional[pd.DataFrame] = None,
-            window_hours: Optional[float] = None) -> Dict[str, Any]:
+            window_hours: Optional[float] = None, objects: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Return {'recommender_kwargs': {...}, 'summary': {...}, 'findings': [...]} (pure, no I/O)."""
     findings: List[Dict[str, str]] = []
 
@@ -364,6 +484,21 @@ def analyze(static: Dict[str, Any], sampled: Optional[pd.DataFrame] = None,
     if static["config"].get("self_tuning_mem", "").upper() == "OFF":
         add("info", "STMM off", "Self-tuning memory is off, so Db2 memory is set by hand. The buffer pool size (used here as a stand-in for "
             "the data kept in memory) may not match real usage, so treat the memory estimate with care.")
+
+    if objects:
+        rdf, vdf = objects["routines"], objects["views"]
+        bad = vdf[vdf["valid"].str.upper() == "N"]
+        if len(bad):
+            add("warning", f"{len(bad)} invalid view(s)", f"Views Db2 marks as invalid: {', '.join(bad['view'][:5])}. "
+                "They depend on dropped or changed objects and will fail on PostgreSQL too.")
+        high = rdf[rdf["effort"] == "High"]
+        if len(high):
+            add("risk", f"{len(high)} high-effort routine(s)", "Routines that are external (Java/C), use several Db2-only "
+                "SQL PL features, or are very long. Plan a manual rewrite: " + ", ".join(high["routine"][:5]))
+        ext = rdf[rdf["language"].str.upper() != "SQL"]
+        if len(ext):
+            add("risk", f"{len(ext)} external routine(s)", "Routines written in a language other than SQL PL run outside "
+                "the database engine. They need a new home (PL/pgSQL, or an application / Azure Function).")
 
     return {"recommender_kwargs": kwargs, "summary": summary, "findings": findings,
             "tables": tdf, "tablespaces": sdf, "sampled": sampled}
