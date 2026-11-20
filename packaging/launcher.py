@@ -29,7 +29,7 @@ def free_port(start: int = 8501, tries: int = 50) -> int:
 def main() -> None:
     root = app_root()
     # Remember where the user started us, so dataset search still looks in their folder.
-    os.environ.setdefault("AMA_LAUNCH_DIR", str(Path.cwd()))
+    os.environ.setdefault("DB2M_LAUNCH_DIR", str(Path.cwd()))
     # Streamlit finds .streamlit/config.toml (theme) relative to the working directory.
     os.chdir(root)
     sys.path.insert(0, str(root))
@@ -43,7 +43,7 @@ def main() -> None:
         "--server.address=127.0.0.1",
         "--browser.gatherUsageStats=false",
     ]
-    print(f"Azure Migration Assistant starting at http://localhost:{port}  (close this window to stop)")
+    print(f"DB2 migration starting at http://localhost:{port}  (close this window to stop)")
 
     from streamlit.web import cli as stcli
 

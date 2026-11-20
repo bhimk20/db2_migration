@@ -13,7 +13,8 @@ from core.path_manager import (
     find_local_system_path,
     scan_default_local_files,
     load_persistent_paths,
-    clear_persistent_paths
+    clear_persistent_paths,
+    expand_user_paths
 )
 from core.dataset_loader import load_dataset_from_source, load_sample_data, convert_df_to_excel_bytes
 from core import app_lookup, azure_recommender
@@ -38,7 +39,7 @@ if "initialized_from_saved_paths" not in st.session_state:
 
 
 # ---------------- MAIN CONTENT ----------------
-st.title("Azure migration assistant")
+st.title("DB2 migration")
 st.caption("Application hardware sizing & target architecture planner")
 
 # Single upload section on main page
@@ -54,8 +55,8 @@ REQUIRED_DATASETS = [
 with st.container(border=True):
     col_u_hdr, col_u_actions = st.columns([2.5, 2.5], vertical_alignment="center")
     with col_u_hdr:
-        st.subheader("Upload datasets")
-        st.caption("Drop all your Excel or CSV files at once. Each file is detected by name and schema.")
+        st.subheader("Load datasets")
+        st.caption("Point to your Excel or CSV files on this computer. Each file is detected by name and schema.")
     with col_u_actions:
         c_btn_local, c_btn_sample, c_btn_clear = st.columns(3)
         with c_btn_local:
@@ -81,31 +82,82 @@ with st.container(border=True):
                 st.session_state.uploader_version += 1  # reset uploader widget
                 st.rerun()
 
-    uploaded_files = st.file_uploader(
-        "Drop or upload Excel or CSV files",
-        type=["xlsx", "xls", "csv"],
-        accept_multiple_files=True,
-        key=f"uploader_all_{st.session_state.uploader_version}",
-        help="One upload for every dataset. Files are matched to slots by their name."
+    # Path section: point to files or folders on this computer
+    path_text = st.text_area(
+        "File or folder paths",
+        key="local_paths_text",
+        persist_state="session",
+        height=100,
+        placeholder="C:\\data\\cmdb_ci_server.xlsx or /Users/me/exports",
+        help="One path per line. A file loads directly. A folder is scanned (not its sub-folders) for .xlsx, .xls and .csv files. Quotes around the path are fine.",
     )
-
-    # Sync uploaded files with loaded datasets (one dataset per detected schema)
-    cur_names = [f.name for f in uploaded_files]
-    prev_names = st.session_state.get("last_upload_names", [])
-    if cur_names != prev_names:
-        for name in prev_names:
-            if name not in cur_names:
-                st.session_state.datasets.pop(name, None)
-        for f in uploaded_files:
-            if f.name not in prev_names:
-                schema = detect_schema(f.name)
-                if schema != "Custom / Unknown":
-                    for k in [k for k, v in st.session_state.datasets.items() if v.get("detected_schema") == schema]:
+    if st.button("Load files", type="primary", icon=":material/folder_open:", help="Load the files and folders listed above"):
+        if not path_text.strip():
+            st.warning("Enter at least one file or folder path first.")
+        else:
+            found_files, path_errors = expand_user_paths(path_text)
+            loaded_count = 0
+            skipped_count = 0
+            for path, from_folder in found_files:
+                schema = detect_schema(path.name)
+                if from_folder and schema == "Custom / Unknown":
+                    skipped_count += 1
+                    continue
+                # Replace the previously loaded dataset of the same schema (after a successful load)
+                replaced_keys = [
+                    k for k, v in st.session_state.datasets.items()
+                    if schema != "Custom / Unknown" and v.get("detected_schema") == schema and k != path.name
+                ]
+                if load_dataset_from_source(path):
+                    loaded_count += 1
+                    for k in replaced_keys:
                         del st.session_state.datasets[k]
-                load_dataset_from_source(f)
-        st.session_state["last_upload_names"] = cur_names
-        st.session_state.active_app_num = ""
-        st.rerun()
+                else:
+                    path_errors.append(f"Could not load: {path}")
+            st.session_state["path_load_report"] = {
+                "loaded": loaded_count,
+                "skipped": skipped_count,
+                "errors": path_errors,
+            }
+            st.session_state.active_app_num = ""
+            st.rerun()
+
+    # Report from the previous "Load files" click
+    path_report = st.session_state.pop("path_load_report", None)
+    if path_report:
+        if path_report["loaded"]:
+            st.success(f"Loaded {path_report['loaded']} file(s) from paths.", icon=":material/check_circle:")
+        if path_report["skipped"]:
+            st.caption(f"Skipped {path_report['skipped']} file(s) in folders whose names match no known schema.")
+        if path_report["errors"]:
+            st.warning("\n".join(f"- {line}" for line in path_report["errors"]), icon=":material/warning:")
+
+    with st.expander("Or drop files here", icon=":material/upload:"):
+        uploaded_files = st.file_uploader(
+            "Drop or upload Excel or CSV files",
+            type=["xlsx", "xls", "csv"],
+            accept_multiple_files=True,
+            key=f"uploader_all_{st.session_state.uploader_version}",
+            help="One upload for every dataset. Files are matched to slots by their name."
+        )
+
+        # Sync uploaded files with loaded datasets (one dataset per detected schema)
+        cur_names = [f.name for f in uploaded_files]
+        prev_names = st.session_state.get("last_upload_names", [])
+        if cur_names != prev_names:
+            for name in prev_names:
+                if name not in cur_names:
+                    st.session_state.datasets.pop(name, None)
+            for f in uploaded_files:
+                if f.name not in prev_names:
+                    schema = detect_schema(f.name)
+                    if schema != "Custom / Unknown":
+                        for k in [k for k, v in st.session_state.datasets.items() if v.get("detected_schema") == schema]:
+                            del st.session_state.datasets[k]
+                    load_dataset_from_source(f)
+            st.session_state["last_upload_names"] = cur_names
+            st.session_state.active_app_num = ""
+            st.rerun()
 
     # Status of the three required datasets
     status_cols = st.columns(3)
@@ -124,7 +176,7 @@ with st.container(border=True):
 
 if not st.session_state.datasets:
     # Empty State Guidance
-    st.info("Upload the Excel or CSV files above for **ARM Service Now**, **BA_AS_SERVER**, and **CMDB_CI_SERVER**, or click **Sample data** to preview application sizing immediately.", title="Getting started", icon=":material/lightbulb:")
+    st.info("Paste the paths to your Excel or CSV files for **ARM Service Now**, **BA_AS_SERVER**, and **CMDB_CI_SERVER** above and click **Load files**. You can also drop files under **Or drop files here**, or click **Sample data** to preview application sizing immediately.", title="Getting started", icon=":material/lightbulb:")
 else:
     # Top-level Tabs
     main_tab_lookup, main_tab_explorer = st.tabs([":material/search: Application sizing lookup", ":material/table_chart: Raw datasets explorer"])

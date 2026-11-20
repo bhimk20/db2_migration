@@ -1,5 +1,5 @@
 """
-Azure Migration Assistant - entrypoint.
+DB2 migration - entrypoint.
 Sets up the page, shared session state, the sidebar and page navigation.
 Pages live in app_pages/.
 """
@@ -7,7 +7,7 @@ Pages live in app_pages/.
 import streamlit as st
 
 st.set_page_config(
-    page_title="Azure Migration Assistant - App Sizing & Data Explorer",
+    page_title="DB2 Migration - App Sizing & Data Explorer",
     page_icon=":material/cloud:",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -21,7 +21,7 @@ if "active_app_num" not in st.session_state:
 
 # ---------------- SIDEBAR ----------------
 with st.sidebar:
-    st.title("Migration assistant")
+    st.title("DB2 migration")
     st.caption("Application sizing & Excel explorer")
 
     with st.expander("Dataset status", icon=":material/dataset:"):

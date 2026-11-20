@@ -33,12 +33,20 @@ def _sample_settings() -> dict:
                 window_s=int(s.get("db2_window", DEFAULT_WINDOW_S)))
 
 
+def _instance_databases(src: Db2Source) -> Optional[list]:
+    """Docker mode: every database listed for the container (the job reads all of them). TCP mode: None (typed database only)."""
+    conn = st.session_state.get("db2_conn")
+    if src.container and conn:
+        return list(conn["databases"])
+    return None
+
+
 @st.dialog("Re-run assessment?")
 def _confirm_rerun(src: Db2Source, window_s: int) -> None:
-    st.write(f"This takes about {window_s + 40} seconds and replaces the saved result.")
+    st.write(f"This re-reads all databases and takes about {window_s + 60} seconds. It replaces the saved result.")
     confirm, cancel = st.columns(2)
     if confirm.button("Re-run", type="primary", width="stretch", key="db2_rerun_confirm"):
-        start_assessment(src, force=True, **_sample_settings())
+        start_assessment(src, databases=_instance_databases(src), force=True, **_sample_settings())
         st.rerun()
     if cancel.button("Cancel", width="stretch", key="db2_rerun_cancel"):
         st.rerun()
@@ -50,14 +58,14 @@ def _live_progress(src: Db2Source, needs: str, had_objects: bool) -> None:
     job = get_job(src)
     if job is None:
         return
-    if not job.active or (needs == "objects" and job.objects is not None and not had_objects):
+    if not job.active or (needs == "objects" and src.database in job.objects and not had_objects):
         st.rerun()
     st.progress(job.progress, text=f"Assessing in the background: {job.stage}. You can keep browsing.")
 
 
 def _status(src: Db2Source, job: Job, needs: str) -> None:
     if job.active:
-        _live_progress(src, needs, job.objects is not None)
+        _live_progress(src, needs, src.database in job.objects)
         return
     if job.status == "error":
         st.error(f"Assessment failed: {job.error}", icon=":material/error:")
@@ -68,7 +76,7 @@ def _status(src: Db2Source, job: Job, needs: str) -> None:
         if st.button("Re-run assessment", icon=":material/refresh:", key="db2_rerun", width="stretch"):
             _confirm_rerun(src, job.window_s)
     elif st.button("Retry", icon=":material/refresh:", key="db2_rerun", width="stretch"):
-        start_assessment(src, force=True, **_sample_settings())
+        start_assessment(src, databases=_instance_databases(src), force=True, **_sample_settings())
         st.rerun()
 
 
@@ -133,6 +141,8 @@ def connection_form(needs: str = "result") -> Optional[Db2Source]:
             return None
 
         src = Db2Source(database=database, container=container, host=host, port=port, user=user, password=pw)
+        # one job per instance: picking a schema or switching database later reuses it
+        job = get_job(src) or start_assessment(src, databases=_instance_databases(src), **_sample_settings())
         try:
             schemas = _schemas(conn_key(src), src)
         except (Db2Error, ValueError, OSError) as exc:
@@ -141,11 +151,12 @@ def connection_form(needs: str = "result") -> Optional[Db2Source]:
         if not schemas:
             st.warning(f"{database} has no user schemas with objects.", icon=":material/folder_off:")
             return None
-        if st.session_state.get("db2_schema_pick") not in schemas:
+        options = ["All schemas"] + list(schemas)
+        if st.session_state.get("db2_schema_pick") not in options:
             st.session_state.pop("db2_schema_pick", None)
-        src.schema = st.selectbox("Schema", schemas, key="db2_schema_pick", **_KEEP,
-                                  help=f"{len(schemas)} schemas in {database}. One schema is assessed at a time.")
+        pick = st.selectbox("Schema", options, key="db2_schema_pick", **_KEEP,
+                            help=f"{len(schemas)} schemas in {database}. All schemas, or one schema to filter the pages.")
+        src.schema = "" if pick == "All schemas" else pick
 
-        job = get_job(src) or start_assessment(src, **_sample_settings())
         _status(src, job, needs)
     return src

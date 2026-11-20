@@ -1,8 +1,10 @@
 """
 Background Db2 assessment jobs.
 
-One job per (connection, database, schema). It runs in a worker thread so the UI stays usable, and the
-result stays in this process (survives reruns and page changes) and on disk (survives restarts).
+One job per instance (a docker container, or host:port:user|database over TCP). It runs in a worker
+thread so the UI stays usable. Every database of the instance is read in parallel (catalog first, then
+workload sampling for all of them over the same window). The result stays in this process (survives
+reruns and page changes) and on disk (survives restarts).
 No Streamlit calls in here: worker threads have no script context.
 """
 
@@ -10,19 +12,19 @@ import pickle
 import re
 import threading
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict, List, Optional
 
-from core.db2_metrics import Db2Source, analyze, collect_objects, collect_sampled, collect_static
+from core.db2_metrics import Db2Source, collect_objects, collect_sampled, collect_static
+from core.path_manager import APP_DIR
 
-CACHE_DIR = Path.home() / ".azure_migration_assistant" / "db2"
+CACHE_DIR = APP_DIR / "db2"
 DEFAULT_INTERVAL_S = 30
 DEFAULT_WINDOW_S = 60
-SAMPLE_REUSE_S = 3600  # reuse a workload sample for another schema of the same database for this long
 
 _JOBS: Dict[str, "Job"] = {}
-_SAMPLES: Dict[str, tuple] = {}  # conn_key -> (taken_at, interval, window, DataFrame)
 _LOCK = threading.Lock()
 
 
@@ -32,8 +34,8 @@ class Job:
     status: str = "queued"      # queued | running | done | error
     stage: str = "Queued"
     progress: float = 0.0
-    objects: Optional[Dict[str, Any]] = None   # available as soon as the catalog is read
-    result: Optional[Dict[str, Any]] = None    # analyze() output, set when done
+    objects: Dict[str, dict] = field(default_factory=dict)  # database -> objects, filled as each catalog is read
+    result: Optional[dict] = None  # {"host", "taken", "databases": {DB: {static, objects, sampled, error}}}
     error: str = ""
     started: float = 0.0
     finished: float = 0.0
@@ -52,12 +54,19 @@ def conn_key(src: Db2Source) -> str:
     return f"{where}|{src.database}"
 
 
+def instance_key(src: Db2Source) -> str:
+    """Identifies the instance (container, or host:port:user|database over TCP). One job per instance."""
+    if src.container:
+        return src.container
+    return f"{src.host}:{src.port}:{src.user}|{src.database}"
+
+
 def job_key(src: Db2Source) -> str:
-    return f"{conn_key(src)}|{src.schema.upper()}"
+    return instance_key(src)
 
 
 def _disk_path(key: str) -> Path:
-    return CACHE_DIR / (re.sub(r"[^A-Za-z0-9_.-]+", "_", key) + ".pkl")
+    return CACHE_DIR / ("v2_" + re.sub(r"[^A-Za-z0-9_.-]+", "_", key) + ".pkl")
 
 
 def _save(job: Job) -> None:
@@ -89,46 +98,99 @@ def get_job(src: Db2Source) -> Optional[Job]:
         return job
 
 
-def _run(job: Job, src: Db2Source) -> None:
+def _error_text(exc: Exception) -> str:
+    return (str(exc) or type(exc).__name__)[:300]
+
+
+def _run(job: Job, src: Db2Source, databases: List[str]) -> None:
+    """Phase 1 reads catalogs of all databases, phase 2 samples workload, phase 3 assembles the result.
+
+    A database that fails is marked with its error and the others continue. The job fails only when
+    no database could be read at all.
+    """
     try:
         job.status, job.started = "running", time.time()
-        job.stage, job.progress = "Reading size and configuration", 0.05
-        static = collect_static(src)
+        n = len(databases)
+        if n == 0:
+            raise RuntimeError("No database to read")
+        reads: Dict[str, dict] = {
+            db: {"static": None, "objects": None, "sampled": None, "error": ""} for db in databases
+        }
 
-        job.stage, job.progress = "Reading tables, views and routines", 0.15
-        objects = collect_objects(src)
-        objects["schema"], objects["database"] = src.schema.upper(), src.database
-        job.objects = objects
+        # phase 1: catalog of every database, at most 4 at once
+        progress_lock = threading.Lock()
+        done = 0
+        job.stage, job.progress = f"Reading {n} databases (0/{n} done)", 0.05
 
-        sampled = None
+        def read(db: str) -> None:
+            nonlocal done
+            entry = reads[db]
+            try:
+                dsrc = Db2Source(**{**vars(src), "database": db, "schema": ""})
+                static = collect_static(dsrc)
+                objects = collect_objects(dsrc)
+                objects["database"] = db
+                entry["static"], entry["objects"] = static, objects
+                job.objects[db] = objects
+            except Exception as exc:
+                entry["static"] = entry["objects"] = None
+                entry["error"] = _error_text(exc)
+            with progress_lock:
+                done += 1
+                job.stage = f"Reading {n} databases ({done}/{n} done)"
+                job.progress = 0.05 + 0.25 * done / n
+
+        with ThreadPoolExecutor(max_workers=min(4, n)) as pool:
+            list(pool.map(read, databases))
+
+        ok = [db for db in databases if reads[db]["static"] is not None]
+        if not ok:
+            first_error = next((reads[db]["error"] for db in databases if reads[db]["error"]), "no data")
+            raise RuntimeError(first_error)
+
+        # phase 2: workload of every readable database, in parallel, same window
         if job.sample_on:
-            ck = conn_key(src)
-            hit = _SAMPLES.get(ck)
-            if hit and hit[1] == job.interval_s and hit[2] == job.window_s and time.time() - hit[0] < SAMPLE_REUSE_S:
-                sampled = hit[3]
-            else:
-                job.stage, job.progress = f"Measuring workload for {job.window_s} s", 0.25
+            fractions = {db: 0.0 for db in ok}
+            job.stage, job.progress = "Measuring workload (0%)", 0.30
+
+            def sample(db: str) -> None:
+                entry = reads[db]
 
                 def on_progress(frac: float) -> None:
-                    job.progress = 0.25 + 0.65 * frac
-                    job.stage = f"Measuring workload ({int(frac * 100)}%)"
+                    with progress_lock:
+                        fractions[db] = frac
+                        mean = sum(fractions.values()) / len(fractions)
+                        job.progress = 0.30 + 0.65 * mean
+                        job.stage = f"Measuring workload ({int(mean * 100)}%)"
 
-                sampled = collect_sampled(src, static["host"]["cpus"], job.interval_s,
-                                          duration_s=job.window_s, progress=on_progress)
-                _SAMPLES[ck] = (time.time(), job.interval_s, job.window_s, sampled)
+                try:
+                    dsrc = Db2Source(**{**vars(src), "database": db, "schema": ""})
+                    entry["sampled"] = collect_sampled(dsrc, entry["static"]["host"]["cpus"], job.interval_s,
+                                                       duration_s=job.window_s, progress=on_progress)
+                except Exception:
+                    entry["sampled"] = None  # sampling failure does not fail the job
 
-        job.stage, job.progress = "Analyzing", 0.95
-        job.result = analyze(static, sampled, objects=objects)
+            with ThreadPoolExecutor(max_workers=len(ok)) as pool:
+                list(pool.map(sample, ok))
+
+        # phase 3: assemble the result
+        job.result = {
+            "host": reads[ok[0]]["static"]["host"],
+            "taken": time.time(),
+            "databases": reads,
+        }
         job.status, job.stage, job.progress, job.finished = "done", "Done", 1.0, time.time()
         _save(job)
     except Exception as exc:  # worker must never die silently
         job.status, job.error, job.finished = "error", str(exc) or type(exc).__name__, time.time()
 
 
-def start_assessment(src: Db2Source, sample_on: bool = True, interval_s: int = DEFAULT_INTERVAL_S,
-                     window_s: int = DEFAULT_WINDOW_S, force: bool = False) -> Job:
-    """Start a background assessment unless one is running, or a finished one exists and `force` is off."""
+def start_assessment(src: Db2Source, databases: Optional[List[str]] = None, sample_on: bool = True,
+                     interval_s: int = DEFAULT_INTERVAL_S, window_s: int = DEFAULT_WINDOW_S,
+                     force: bool = False) -> Job:
+    """Start a background assessment of the instance unless one is running, or a finished one exists and `force` is off."""
     key = job_key(src)
+    dbs = list(databases) if databases else [src.database]
     with _LOCK:
         job = _JOBS.get(key) or _load(key)
         if job and job.active:
@@ -136,11 +198,9 @@ def start_assessment(src: Db2Source, sample_on: bool = True, interval_s: int = D
         if job and job.status == "done" and not force:
             _JOBS[key] = job
             return job
-        if force:
-            _SAMPLES.pop(conn_key(src), None)
         job = Job(key=key, sample_on=sample_on, interval_s=int(interval_s), window_s=int(window_s))
         _JOBS[key] = job
     # worker gets its own copy: the password stays in memory only for the life of the run
     worker_src = Db2Source(**vars(src))
-    threading.Thread(target=_run, args=(job, worker_src), daemon=True, name=f"db2-{key}").start()
+    threading.Thread(target=_run, args=(job, worker_src, dbs), daemon=True, name=f"db2-{key}").start()
     return job

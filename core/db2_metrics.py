@@ -10,6 +10,9 @@ Two ways to reach Db2:
 
 Counters from MON_GET_* are cumulative since database activation, so `collect_sampled` takes
 snapshots and works on deltas.
+
+Catalog collectors (`collect_static`, `collect_objects`) cover every user schema of the database. Results are
+grouped by schema (`*_by_schema` dicts and a leading `schema` column); system schemas are skipped (`USER_SCHEMA_SQL`).
 """
 
 import re
@@ -23,6 +26,12 @@ import pandas as pd
 
 SEP = "|"
 _IDENT = re.compile(r"^[A-Za-z0-9_$#@.\-]+$")
+
+# Where-fragment on a `schemaname` column: user schemas only (skips SYS*, IBM* and Db2 internal schemas)
+USER_SCHEMA_SQL = ("schemaname not like 'SYS%' and schemaname not in ('NULLID','SQLJ','DB2GSE','IBM_RTMON','ADMIN') "
+                   "and schemaname not like 'IBM%'")
+# `<schema column> in (...)` subquery over the user schemas
+_USER_SCHEMAS = f"in (select schemaname from syscat.schemata where {USER_SCHEMA_SQL})"
 
 
 @dataclass
@@ -51,7 +60,7 @@ class Db2Error(RuntimeError):
 def _run_docker(src: Db2Source, sql: str) -> List[List[str]]:
     script = f"db2 connect to {src.database} >/dev/null && db2 -x {shlex.quote(sql)}"
     cmd = ["docker", "exec", src.container, "su", "-", src.instance_user, "-c", script]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    proc = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=120)
     out = proc.stdout.strip()
     # db2 -x exit code 1 = "no rows"; >=2 = error
     if proc.returncode >= 2 or "SQL0" in out[:20] or "SQL1" in out[:20]:
@@ -91,10 +100,24 @@ def _f(value: str, default: float = 0.0) -> float:
 
 
 # ---------------------------------------------------------------- static collection
+def _grouped_counts(src: Db2Source, schemas: List[str],
+                    specs: List[tuple]) -> Dict[str, Dict[str, int]]:
+    """{schema: {key: count}} from one grouped query per spec (key, table, schema column, extra condition).
+    Every schema in `schemas` gets every key, default 0."""
+    keys = [spec[0] for spec in specs]
+    out: Dict[str, Dict[str, int]] = {s: dict.fromkeys(keys, 0) for s in schemas}
+    for key, table, col, extra in specs:
+        rows = run_sql(src, [col, "count(*)"],
+                       f"from {table} where {col} {_USER_SCHEMAS}{extra} group by {col}")
+        for sch, n in rows:
+            out.setdefault(sch, dict.fromkeys(keys, 0))[key] = int(_f(n))
+    return out
+
+
 def collect_static(src: Db2Source) -> Dict[str, Any]:
-    """Point-in-time facts: host, sizes, config, inventory, migration risks."""
-    s = src.schema.upper()
-    out: Dict[str, Any] = {"database": src.database, "schema": s}
+    """Point-in-time facts: host, sizes, config, inventory, migration risks. Covers all user schemas
+    (src.schema is not used)."""
+    out: Dict[str, Any] = {"database": src.database}
 
     r = run_sql(src, ["total_cpus", "total_memory", "os_name", "host_name"],
                 "from table(sysproc.env_get_sys_info())")[0]
@@ -103,14 +126,18 @@ def collect_static(src: Db2Source) -> Dict[str, Any]:
     r = run_sql(src, ["service_level", "bld_level"], "from sysibmadm.env_inst_info")[0]
     out["version"] = r[0]
 
+    # '' = all schemas (same convention as the tabname argument). If this call fails on a Db2 version,
+    # fall back to one admin_get_tab_info(schema, '') call per user schema.
     tabs = run_sql(src, [
-        "t.tabname", "coalesce(t.card,-1)", "coalesce(i.data_object_p_size,0)", "coalesce(i.index_object_p_size,0)",
+        "t.tabschema", "t.tabname", "coalesce(t.card,-1)", "coalesce(i.data_object_p_size,0)",
+        "coalesce(i.index_object_p_size,0)",
         "coalesce(i.long_object_p_size,0)+coalesce(i.lob_object_p_size,0)+coalesce(i.xml_object_p_size,0)",
         "t.tableorg",
-    ], f"from syscat.tables t left join table(sysproc.admin_get_tab_info('{s}','')) i "
+    ], f"from syscat.tables t left join table(sysproc.admin_get_tab_info('','')) i "
        f"on i.tabschema=t.tabschema and i.tabname=t.tabname "
-       f"where t.type='T' and t.tabschema='{s}' order by coalesce(i.data_object_p_size,0) desc")
-    tdf = pd.DataFrame(tabs, columns=["table", "rows", "data_kb", "index_kb", "lob_xml_kb", "organization"])
+       f"where t.type='T' and t.tabschema {_USER_SCHEMAS} order by coalesce(i.data_object_p_size,0) desc")
+    tdf = pd.DataFrame(tabs, columns=["schema", "table", "rows", "data_kb", "index_kb", "lob_xml_kb",
+                                      "organization"])
     for c in ("rows", "data_kb", "index_kb", "lob_xml_kb"):
         tdf[c] = pd.to_numeric(tdf[c], errors="coerce").fillna(0)
     tdf["total_kb"] = tdf["data_kb"] + tdf["index_kb"] + tdf["lob_xml_kb"]
@@ -132,20 +159,27 @@ def collect_static(src: Db2Source) -> Dict[str, Any]:
                   "from sysibmadm.dbcfg where name in ('logfilsiz','logprimary','logsecond','self_tuning_mem')")
     out["config"] = {k.strip(): v.strip() for k, v in cfg}
 
-    cols = run_sql(src, ["typename", "count(*)"],
-                   f"from syscat.columns where tabschema='{s}' group by typename")
-    out["column_types"] = {k: int(_f(v)) for k, v in cols}
+    schemas = list_schemas(src)
+    cols = run_sql(src, ["tabschema", "typename", "count(*)"],
+                   f"from syscat.columns where tabschema {_USER_SCHEMAS} group by tabschema, typename")
+    col_types: Dict[str, Dict[str, int]] = {s: {} for s in schemas}
+    for sch, typ, n in cols:
+        col_types.setdefault(sch, {})[typ] = int(_f(n))
+    out["column_types_by_schema"] = col_types
 
-    counts = {}
-    for key, tail in (("indexes", f"from syscat.indexes where tabschema='{s}'"),
-                      ("routines", f"from syscat.routines where routineschema='{s}'"),
-                      ("triggers", f"from syscat.triggers where trigschema='{s}'"),
-                      ("sequences", f"from syscat.sequences where seqschema='{s}'")):
-        counts[key] = int(_f(run_sql(src, ["count(*)"], tail)[0][0]))
-    out["counts"] = counts
-    mdc = run_sql(src, ["tabname"], f"from syscat.indexes where tabschema='{s}' and indextype='BLOK' "
-                                    f"group by tabname")
-    out["mdc_tables"] = [m[0] for m in mdc]
+    out["counts_by_schema"] = _grouped_counts(src, schemas, [
+        ("indexes", "syscat.indexes", "tabschema", ""),
+        ("routines", "syscat.routines", "routineschema", ""),
+        ("triggers", "syscat.triggers", "trigschema", ""),
+        ("sequences", "syscat.sequences", "seqschema", ""),
+    ])
+
+    mdc = run_sql(src, ["tabschema", "tabname"], f"from syscat.indexes where tabschema {_USER_SCHEMAS} "
+                                                 f"and indextype='BLOK' group by tabschema, tabname")
+    mdc_by_schema: Dict[str, List[str]] = {s: [] for s in schemas}
+    for sch, tab in mdc:
+        mdc_by_schema.setdefault(sch, []).append(tab)
+    out["mdc_by_schema"] = mdc_by_schema
     return out
 
 
@@ -173,7 +207,7 @@ def list_containers() -> List[str]:
     """Running docker containers whose image looks like Db2 (empty when docker is missing or stopped)."""
     try:
         proc = subprocess.run(["docker", "ps", "--format", "{{.Names}}|{{.Image}}"],
-                              capture_output=True, text=True, timeout=10)
+                              capture_output=True, encoding="utf-8", errors="replace", timeout=10)
     except (OSError, subprocess.SubprocessError):
         return []
     rows = [line.split("|", 1) for line in proc.stdout.splitlines() if "|" in line]
@@ -187,7 +221,7 @@ def list_databases(src: Db2Source) -> List[str]:
     src.validate()
     cmd = ["docker", "exec", src.container, "su", "-", src.instance_user, "-c", "db2 list db directory"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:
         raise Db2Error(f"Cannot reach container '{src.container}': {exc}") from exc
     if proc.returncode >= 2 and not proc.stdout.strip():
@@ -210,48 +244,49 @@ def list_databases(src: Db2Source) -> List[str]:
 def list_schemas(src: Db2Source) -> List[str]:
     """Non-system schemas that own at least one table, view or routine."""
     rows = run_sql(src, ["schemaname"],
-                   "from syscat.schemata where schemaname not like 'SYS%' and schemaname not in "
-                   "('NULLID','SQLJ','DB2GSE','IBM_RTMON','ADMIN') and schemaname not like 'IBM%' "
-                   "order by schemaname")
+                   f"from syscat.schemata where {USER_SCHEMA_SQL} order by schemaname")
     return [r[0].strip() for r in rows]
 
 
-def collect_objects(src: Db2Source) -> Dict[str, pd.DataFrame]:
-    """Inventory of the schema: tables (structure), views and routines (procedures / functions).
-    Catalog queries only. Source text is not fetched, just its length and migration-relevant flags."""
-    s = src.schema.upper()
-    out: Dict[str, pd.DataFrame] = {}
+def collect_objects(src: Db2Source) -> Dict[str, Any]:
+    """Inventory of all user schemas: tables (structure), views and routines (procedures / functions), and
+    trigger / sequence counts per schema. Catalog queries only. Source text is not fetched, just its length
+    and migration-relevant flags."""
+    out: Dict[str, Any] = {}
+    schemas = list_schemas(src)
 
     t = run_sql(src, [
-        "t.tabname", "t.colcount", "coalesce(t.card,-1)", "t.tableorg",
+        "t.tabschema", "t.tabname", "t.colcount", "coalesce(t.card,-1)", "t.tableorg",
         f"(select count(*) from syscat.keycoluse k join syscat.tabconst c on c.constname=k.constname and "
         f"c.tabschema=k.tabschema and c.tabname=k.tabname where c.tabschema=t.tabschema and c.tabname=t.tabname and c.type='P')",
         f"(select count(*) from syscat.tabconst c where c.tabschema=t.tabschema and c.tabname=t.tabname and c.type='F')",
         f"(select count(*) from syscat.indexes i where i.tabschema=t.tabschema and i.tabname=t.tabname)",
         f"(select count(*) from syscat.triggers g where g.tabschema=t.tabschema and g.tabname=t.tabname)",
-    ], f"from syscat.tables t where t.type='T' and t.tabschema='{s}' order by t.tabname")
-    tdf = pd.DataFrame(t, columns=["table", "columns", "rows", "organization", "pk_columns", "foreign_keys",
-                                   "indexes", "triggers"])
+    ], f"from syscat.tables t where t.type='T' and t.tabschema {_USER_SCHEMAS} "
+       f"order by t.tabschema, t.tabname")
+    tdf = pd.DataFrame(t, columns=["schema", "table", "columns", "rows", "organization", "pk_columns",
+                                   "foreign_keys", "indexes", "triggers"])
     for c in ("columns", "rows", "pk_columns", "foreign_keys", "indexes", "triggers"):
         tdf[c] = pd.to_numeric(tdf[c], errors="coerce").fillna(0).astype(int)
     out["tables"] = tdf
 
     v = run_sql(src, [
-        "v.viewname", "v.valid", "coalesce(length(v.text),0)",
+        "v.viewschema", "v.viewname", "v.valid", "coalesce(length(v.text),0)",
         "(select count(*) from syscat.tabdep d where d.tabschema=v.viewschema and d.tabname=v.viewname)",
-    ], f"from syscat.views v where v.viewschema='{s}' order by v.viewname")
-    vdf = pd.DataFrame(v, columns=["view", "valid", "text_length", "dependencies"])
+    ], f"from syscat.views v where v.viewschema {_USER_SCHEMAS} order by v.viewschema, v.viewname")
+    vdf = pd.DataFrame(v, columns=["schema", "view", "valid", "text_length", "dependencies"])
     for c in ("text_length", "dependencies"):
         vdf[c] = pd.to_numeric(vdf[c], errors="coerce").fillna(0).astype(int)
     out["views"] = vdf
 
     body = "upper(cast(substr(r.text,1,32000) as varchar(32000)))"
     flag_exprs = [f"case when {body} like '%{pat}%' then 1 else 0 end" for pat in _ROUTINE_FLAGS.values()]
-    r = run_sql(src, ["r.routinename", "r.routinetype", "r.language", "r.parm_count",
+    r = run_sql(src, ["r.routineschema", "r.routinename", "r.routinetype", "r.language", "r.parm_count",
                       "coalesce(length(r.text),0)", *flag_exprs],
-                f"from syscat.routines r where r.routineschema='{s}' and r.routinetype in ('P','F') "
-                f"order by r.routinename")
-    rdf = pd.DataFrame(r, columns=["routine", "type", "language", "parameters", "text_length", *_ROUTINE_FLAGS])
+                f"from syscat.routines r where r.routineschema {_USER_SCHEMAS} and r.routinetype in ('P','F') "
+                f"order by r.routineschema, r.routinename")
+    rdf = pd.DataFrame(r, columns=["schema", "routine", "type", "language", "parameters", "text_length",
+                                   *_ROUTINE_FLAGS])
     rdf["type"] = rdf["type"].map({"P": "Procedure", "F": "Function"}).fillna(rdf["type"])
     for c in ("parameters", "text_length", *_ROUTINE_FLAGS):
         rdf[c] = pd.to_numeric(rdf[c], errors="coerce").fillna(0).astype(int)
@@ -261,11 +296,10 @@ def collect_objects(src: Db2Source) -> Dict[str, pd.DataFrame]:
                      zip(rdf["language"], rdf["text_length"], rdf["db2_features"])]
     out["routines"] = rdf
 
-    cnt = {}
-    for key, tail in (("triggers", f"from syscat.triggers where trigschema='{s}'"),
-                      ("sequences", f"from syscat.sequences where seqschema='{s}' and seqtype='S'")):
-        cnt[key] = int(_f(run_sql(src, ["count(*)"], tail)[0][0]))
-    out["counts"] = cnt  # type: ignore[assignment]
+    out["counts_by_schema"] = _grouped_counts(src, schemas, [
+        ("triggers", "syscat.triggers", "trigschema", ""),
+        ("sequences", "syscat.sequences", "seqschema", " and seqtype='S'"),
+    ])
     return out
 
 
@@ -317,7 +351,7 @@ def detect_cpu_limit(src: Db2Source) -> Optional[float]:
               "cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null")
     try:
         proc = subprocess.run(["docker", "exec", src.container, "sh", "-c", script],
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, encoding="utf-8", errors="replace", timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
     parts = (proc.stdout.split("--") + ["", "", ""])[:3]
@@ -346,7 +380,7 @@ def collect_sampled(src: Db2Source, cpus: float, interval_s: int = 30, samples: 
             progress((i + 1) / samples)
     rows = []
     bp_delta = {k: 0.0 for k in ("d_l", "d_p", "i_l", "i_p")}
-    for a, b in zip(snaps, snaps[1:]):
+    for i, (a, b) in enumerate(zip(snaps, snaps[1:])):
         dt = max(b["t"] - a["t"], 1e-6)
         d = {k: b[k] - a[k] for k in b if k not in ("t", "connections")}
         if any(v < 0 for v in d.values()):
@@ -355,6 +389,7 @@ def collect_sampled(src: Db2Source, cpus: float, interval_s: int = 30, samples: 
             bp_delta[k] += d[k]
         phys_io = d["d_p"] + d["i_p"] + d["d_w"] + d["i_w"] + d["direct_reads"] + d["direct_writes"]
         rows.append({
+            "sample": i,  # interval index (kept rows and dropped intervals stay aligned across databases)
             "interval_s": round(dt, 1),
             # total_cpu_time is microseconds of CPU
             "cpu_pct": 100.0 * (d["total_cpu_time"] / 1e6) / (dt * denom),
@@ -366,9 +401,10 @@ def collect_sampled(src: Db2Source, cpus: float, interval_s: int = 30, samples: 
             "connections": max(b["connections"] - 1, 0),  # exclude this collector's own connection
             "log_wait_ms_per_s": d["log_disk_wait_time"] / dt,
         })
-    df = pd.DataFrame(rows, columns=["interval_s", "cpu_pct", "iops", "commits_per_s", "rollbacks_per_s",
+    df = pd.DataFrame(rows, columns=["sample", "interval_s", "cpu_pct", "iops", "commits_per_s", "rollbacks_per_s",
                                       "rows_read_per_s", "rows_returned_per_s", "connections",
                                       "log_wait_ms_per_s"])
+    df["sample"] = df["sample"].astype(int)
     df.attrs["dropped_intervals"] = samples - len(rows)
     df.attrs["cpu_denominator"] = denom
     df.attrs["cpu_limit"] = limit

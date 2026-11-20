@@ -7,15 +7,32 @@ without storing large file byte buffers in memory.
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 from core.schemas import check_filename_includes, normalize_name
 
 # Saved paths live in the user's home so they work for a packaged executable too (the bundle is read-only
 # and shared, and must never ship one person's file paths).
-CONFIG_DIR = Path.home() / ".azure_migration_assistant"
+APP_DIR = Path.home() / ".db2_migration"
+CONFIG_DIR = APP_DIR
 CONFIG_FILE = CONFIG_DIR / "saved_dataset_paths.json"
+LEGACY_DIR = Path.home() / ".azure_migration_assistant"
+SUPPORTED_EXTENSIONS = (".xlsx", ".xls", ".csv")
+
+
+def _migrate_legacy_dir():
+    """Copies the config folder from the previous app name once. The old folder is left in place."""
+    try:
+        if LEGACY_DIR.exists() and not APP_DIR.exists():
+            shutil.copytree(LEGACY_DIR, APP_DIR)
+    except Exception:
+        pass
+
+
+_migrate_legacy_dir()
+
 # Where the user launched the app from (the packaged launcher changes the working directory).
-LAUNCH_DIR = Path(os.environ.get("AMA_LAUNCH_DIR", Path.cwd()))
+LAUNCH_DIR = Path(os.environ.get("DB2M_LAUNCH_DIR") or os.environ.get("AMA_LAUNCH_DIR") or Path.cwd())
 DEFAULT_SEARCH_DIRS = [LAUNCH_DIR / "samples", LAUNCH_DIR, Path.home() / "Downloads"]
 
 
@@ -115,3 +132,67 @@ def scan_default_local_files():
         found["cmdb"] = find_local_system_path("cmdb_ci_server")
 
     return found
+
+
+def clean_user_path(text: str) -> str:
+    """Strips whitespace and surrounding quotes (Windows 'Copy as path' adds them), then expands env vars and '~'."""
+    s = text.strip()
+    while len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
+    s = os.path.expandvars(s)
+    return os.path.expanduser(s)
+
+
+def expand_user_paths(text: str) -> tuple[list[tuple[Path, bool]], list[str]]:
+    """
+    Turns pasted text (one path per line) into dataset files.
+    Returns ([(path, from_folder), ...], [error messages]).
+    A folder is scanned non-recursively; from_folder is True for files found that way.
+    """
+    files: list[tuple[Path, bool]] = []
+    errors: list[str] = []
+    seen: set[Path] = set()
+
+    def add(path: Path, from_folder: bool):
+        key = path.resolve()
+        if key not in seen:
+            seen.add(key)
+            files.append((key, from_folder))
+
+    tokens: list[str] = []
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            continue
+        whole = clean_user_path(raw_line)
+        if Path(whole).exists() or ";" not in raw_line:
+            tokens.append(whole)
+        else:
+            tokens.extend(clean_user_path(part) for part in raw_line.split(";") if part.strip())
+
+    for token in tokens:
+        if not token:
+            continue
+        p = Path(token)
+        if not p.exists():
+            errors.append(f"Not found: {token}")
+        elif p.is_file():
+            if p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                add(p, False)
+            else:
+                errors.append(f"Unsupported file type: {token}")
+        elif p.is_dir():
+            try:
+                candidates = sorted(
+                    (f for f in p.iterdir()
+                     if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS and not f.name.startswith("~$")),
+                    key=lambda f: f.name.lower(),
+                )
+            except OSError as e:
+                errors.append(f"Cannot read folder: {token} ({e.strerror or e})")
+                continue
+            if not candidates:
+                errors.append(f"No Excel or CSV files in: {token}")
+            for f in candidates:
+                add(f, True)
+
+    return files, errors

@@ -1,4 +1,4 @@
-"""Build a one-folder executable of the Azure Migration Assistant with PyInstaller.
+"""Build a one-folder executable of DB2 migration with PyInstaller.
 
     python packaging/build.py            # builds for the current OS into dist/
     python packaging/build.py --onefile  # single file (slower startup)
@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NAME = "AzureMigrationAssistant"
+NAME = "DB2Migration"
 SEP = ";" if os.name == "nt" else ":"
 
 # Only these are shipped alongside the code. samples/ (real-looking exports) is deliberately absent.

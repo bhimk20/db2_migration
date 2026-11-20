@@ -29,7 +29,7 @@ jobs:
         run: python packaging/build.py --onefile
       - uses: actions/upload-artifact@v4
         with:
-          name: AzureMigrationAssistant-${{ matrix.os }}
+          name: DB2Migration-${{ matrix.os }}
           path: |
             dist/*.zip
             dist/*.exe

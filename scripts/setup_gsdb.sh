@@ -50,5 +50,5 @@ docker exec "$CONTAINER" su - "$INSTANCE_USER" -c "
   db2 -x \"SELECT TABSCHEMA, COUNT(*) AS TABLES FROM SYSCAT.TABLES WHERE TABSCHEMA LIKE 'GOSALES%' AND TYPE='T' GROUP BY TABSCHEMA ORDER BY 1\"
 "
 
-echo "Done. Point the DB2 metrics page at database=$DBNAME (docker container=$CONTAINER)."
+echo "Done. Point the DB2 assessment page at database=$DBNAME (docker container=$CONTAINER)."
 echo "Optional cleanup: docker exec $CONTAINER rm -rf $WORK_DIR"
