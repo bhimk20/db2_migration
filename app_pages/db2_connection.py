@@ -1,9 +1,9 @@
 """
 Shared Db2 connection panel used by the DB2 explorer and DB2 assessment pages (not a page itself).
 
-Flow: pick a container (or enter TCP details) -> Connect -> pick database and schema from dropdowns
-filled from the server -> a background assessment starts on its own and its result is kept, so moving
-between pages or coming back later does not repeat any work.
+The panel lives in the sidebar. Flow: pick a container (or enter TCP details) -> Connect -> pick database
+and schema from dropdowns filled from the server -> a background assessment starts on its own and its
+result is kept, so moving between pages or coming back later does not repeat any work.
 """
 
 import time
@@ -33,6 +33,17 @@ def _sample_settings() -> dict:
                 window_s=int(s.get("db2_window", DEFAULT_WINDOW_S)))
 
 
+@st.dialog("Re-run assessment?")
+def _confirm_rerun(src: Db2Source, window_s: int) -> None:
+    st.write(f"This takes about {window_s + 40} seconds and replaces the saved result.")
+    confirm, cancel = st.columns(2)
+    if confirm.button("Re-run", type="primary", width="stretch", key="db2_rerun_confirm"):
+        start_assessment(src, force=True, **_sample_settings())
+        st.rerun()
+    if cancel.button("Cancel", width="stretch", key="db2_rerun_cancel"):
+        st.rerun()
+
+
 @st.fragment(run_every=2)
 def _live_progress(src: Db2Source, needs: str, had_objects: bool) -> None:
     """Polls the background job. Reruns the whole page once when what the page needs becomes available."""
@@ -53,40 +64,45 @@ def _status(src: Db2Source, job: Job, needs: str) -> None:
     else:
         st.caption(f":material/check_circle: Assessment saved {time.strftime('%H:%M', time.localtime(job.finished))}"
                    f" ({'workload sampled for ' + str(job.window_s) + ' s' if job.sample_on else 'no workload sampling'}).")
-    if st.button("Re-run assessment" if job.status == "done" else "Retry", icon=":material/refresh:", key="db2_rerun"):
+    if job.status == "done":
+        if st.button("Re-run assessment", icon=":material/refresh:", key="db2_rerun", width="stretch"):
+            _confirm_rerun(src, job.window_s)
+    elif st.button("Retry", icon=":material/refresh:", key="db2_rerun", width="stretch"):
         start_assessment(src, force=True, **_sample_settings())
         st.rerun()
 
 
 def connection_form(needs: str = "result") -> Optional[Db2Source]:
-    """Render the panel. Returns the chosen source once connected and a schema is picked, else None.
+    """Render the panel in the sidebar. Returns the chosen source once connected and a schema is picked, else None.
 
     `needs` is "objects" for pages that only need the catalog (shown earlier) or "result" for the full analysis.
     """
-    with st.container(border=True):
+    with st.sidebar:
+        st.subheader("Database connection")
         mode = st.segmented_control("Connection type", ["Docker container", "TCP (ibm_db)"], default="Docker container",
                                     required=True, key="db2_mode", **_KEEP)
         docker_mode = mode == "Docker container"
         container = host = user = pw = ""
         port = 50000
-        row = st.container(horizontal=True, vertical_alignment="bottom")
         if docker_mode:
             found = _containers()
             if found:
-                container = row.selectbox("Container", found, accept_new_options=True, key="db2_container_pick",
-                                          help="Running Db2 containers found via docker. Type a name to use another.", **_KEEP) or ""
+                container = st.selectbox("Container", found, accept_new_options=True, key="db2_container_pick",
+                                         help="Running Db2 containers found via docker. Type a name to use another.",
+                                         **_KEEP) or ""
             else:
-                container = row.text_input("Container", key="db2_container_text", placeholder="db2", **_KEEP,
-                                           help="No running Db2 container detected. Start it, or type its name.")
+                container = st.text_input("Container", key="db2_container_text", placeholder="db2", **_KEEP,
+                                          help="No running Db2 container detected. Start it, or type its name.")
             ident = container
         else:
-            host = row.text_input("Host", key="db2_host", **_KEEP)
-            port = int(row.number_input("Port", value=50000, step=1, key="db2_port", **_KEEP))
-            user = row.text_input("User", key="db2_user", **_KEEP)
-            pw = row.text_input("Password", type="password", key="db2_pw", **_KEEP)
+            host = st.text_input("Host", key="db2_host", **_KEEP)
+            port = int(st.number_input("Port", value=50000, step=1, key="db2_port", **_KEEP))
+            user = st.text_input("User", key="db2_user", **_KEEP)
+            pw = st.text_input("Password", type="password", key="db2_pw", **_KEEP)
             ident = f"{host}:{port}:{user}"
         fp = (mode, ident)
-        connect = row.button("Connect", type="primary", icon=":material/power:", disabled=not (container or host))
+        connect = st.button("Connect", type="primary", icon=":material/power:", width="stretch",
+                            disabled=not (container or host))
 
         if connect:
             try:
@@ -104,15 +120,14 @@ def connection_form(needs: str = "result") -> Optional[Db2Source]:
             st.caption("Choose a connection and press **Connect**. Databases and schemas are then offered in dropdowns.")
             return None
 
-        pick = st.container(horizontal=True, vertical_alignment="bottom")
         dbs = conn["databases"]
         if dbs:
             if st.session_state.get("db2_database_pick") not in dbs:
                 st.session_state.pop("db2_database_pick", None)
-            database = pick.selectbox("Database", dbs, key="db2_database_pick", **_KEEP)
+            database = st.selectbox("Database", dbs, key="db2_database_pick", **_KEEP)
         else:
-            database = pick.text_input("Database", key="db2_database_text", **_KEEP,
-                                       help="Db2 cannot list databases over TCP. Type the database name.")
+            database = st.text_input("Database", key="db2_database_text", **_KEEP,
+                                     help="Db2 cannot list databases over TCP. Type the database name.")
         if not database:
             st.caption("Enter the database name to list its schemas.")
             return None
@@ -128,8 +143,8 @@ def connection_form(needs: str = "result") -> Optional[Db2Source]:
             return None
         if st.session_state.get("db2_schema_pick") not in schemas:
             st.session_state.pop("db2_schema_pick", None)
-        src.schema = pick.selectbox("Schema", schemas, key="db2_schema_pick", **_KEEP,
-                                    help=f"{len(schemas)} schemas in {database}. One schema is assessed at a time.")
+        src.schema = st.selectbox("Schema", schemas, key="db2_schema_pick", **_KEEP,
+                                  help=f"{len(schemas)} schemas in {database}. One schema is assessed at a time.")
 
         job = get_job(src) or start_assessment(src, **_sample_settings())
         _status(src, job, needs)
