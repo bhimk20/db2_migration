@@ -50,6 +50,7 @@ scripts/
   run.sh                Run from source (macOS / Linux)
   run.bat               Run from source (Windows)
   setup_gsdb.sh         Installs IBM's GSDB sample database into a Db2 container
+  load_test.sh          Concurrent load inside a Db2 container (for assessment testing)
   setup_gsdb.ps1        Same as setup_gsdb.sh, for Windows PowerShell
   setup_gsdb.bat        Wrapper that runs setup_gsdb.ps1
 .github/workflows/build.yml   Builds Windows and macOS executables
@@ -75,6 +76,8 @@ The bundle contains the code, `docs/` and the theme only. Real exports in `sampl
 Two pages share one connection. **DB2 explorer** lists the tables (keys, indexes), views and stored procedures/functions of a schema, with a rough rewrite effort per routine. **DB2 assessment** runs read-only queries (`MON_GET_*`, `ADMIN_GET_TAB_INFO`, `SYSCAT.*`) against a Db2 database, takes counter snapshots to derive peak CPU, IOPS and connections, lists migration risks (XML, VECTOR, MDC, routines) and feeds the sizing engine. For a ready-made test database, `scripts/setup_gsdb.sh [container] [database]` installs IBM's Great Outdoors sample (GS_DB; use schema GOSALES or GOSALESDW). Connect through a local Docker container (no driver needed) or over TCP with `pip install ibm_db`. The user needs SYSMON or DBADM. Short samples are a demo only: size production from a representative busy window.
 
 **DB2 assessment.** In the sidebar, connect to a Docker Db2 container (or over TCP with `ibm_db`). One background job reads all databases in the container, and the result stays available across page changes and restarts. Use the scope switch to view it as **Schema**, **Database** or **All databases**. Each database has a storage pie chart showing how its space is used.
+
+**Load test.** Start an assessment with a sampling window at least as long as the test, then run `scripts/load_test.sh [container] [duration_s]` (default 120 s). It runs 2 workers on SAMPLE and 6 on GS_DB (schema GOSALES) inside the container, then cleans up. In the **Databases** tab, GS_DB should show clearly higher CPU, IOPS and connections than SAMPLE.
 
 ## Azure sizing rules
 
