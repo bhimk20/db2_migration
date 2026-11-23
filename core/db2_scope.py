@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
+from core.azure_recommender import recommend_options
 from core.db2_metrics import analyze
 
 SCOPES = ("schema", "database", "instance")
@@ -252,11 +253,14 @@ def db_breakdown(result: Dict[str, Any]) -> pd.DataFrame:
     """One row per database of the job result (`result["databases"]` as a dict).
 
     Sizes come from the tablespaces and tables, counts from the objects, peaks from the sampled
-    workload (max of cpu_pct, iops and connections). Unknown values are NaN; a database that
-    failed keeps its error text.
+    workload (max of cpu_pct, iops and connections). Share columns (`*_share_pct`) are percent of
+    the SUM of that column over all databases; the sum of per-database peaks is an upper bound of
+    the true container peak, because the peaks may not occur at the same moment. Unknown values
+    are NaN; a database that failed keeps its error text.
     """
-    cols = ["database", "allocated_gb", "used_gb", "user_data_gb", "tables", "views", "routines",
-            "peak_cpu_pct", "peak_iops", "connections", "error"]
+    cols = ["database", "allocated_gb", "allocated_share_pct", "used_gb", "user_data_gb", "bufferpool_gb",
+            "tables", "views", "routines", "peak_cpu_pct", "peak_cpu_share_pct", "peak_iops",
+            "peak_iops_share_pct", "connections", "connections_share_pct", "error"]
     rows = []
     for name, entry in (result.get("databases") or {}).items():
         static = entry.get("static")
@@ -267,6 +271,7 @@ def db_breakdown(result: Dict[str, Any]) -> pd.DataFrame:
             row["allocated_gb"] = float(ts["allocated_mb"].sum()) / 1024
             row["used_gb"] = float(ts["used_mb"].sum()) / 1024
             row["user_data_gb"] = float(tabs["total_kb"].sum()) / 1024 ** 2
+            row["bufferpool_gb"] = float(static.get("bufferpool_gb") or 0.0)
             objects = entry.get("objects") or {}
             for key, col in (("tables", "tables"), ("views", "views"), ("routines", "routines")):
                 if objects.get(key) is not None:
@@ -278,9 +283,32 @@ def db_breakdown(result: Dict[str, Any]) -> pd.DataFrame:
             row["connections"] = float(sampled["connections"].max())
         rows.append(row)
     df = pd.DataFrame(rows, columns=cols)
+    for src, share in (("allocated_gb", "allocated_share_pct"), ("peak_cpu_pct", "peak_cpu_share_pct"),
+                       ("peak_iops", "peak_iops_share_pct"), ("connections", "connections_share_pct")):
+        total = df[src].sum()
+        df[share] = 100 * df[src] / total if total else float("nan")
     for c in ("tables", "views", "routines", "connections"):
         df[c] = df[c].astype("Int64")
     return df
+
+
+def database_recommendations(result: Dict[str, Any], is_production: bool = False) -> List[Dict[str, Any]]:
+    """One entry per database: its own sizing options, from its own static data and sampled workload.
+
+    Each entry is {"database", "error", "options"}; options is recommend_options() output, or None
+    when the database could not be read or sized (error holds why). One bad database never stops the rest.
+    """
+    out = []
+    for name, entry in (result.get("databases") or {}).items():
+        item: Dict[str, Any] = {"database": name, "error": entry.get("error") or "", "options": None}
+        if entry.get("static") is not None:
+            try:
+                kw = scope_view(result, name, "", "database")["recommender_kwargs"]
+                item["options"] = recommend_options(is_production=is_production, **kw)
+            except Exception as exc:
+                item["error"] = str(exc) or type(exc).__name__
+        out.append(item)
+    return out
 
 
 def scope_objects(objects_by_db: Dict[str, Optional[Dict[str, Any]]], database: str,

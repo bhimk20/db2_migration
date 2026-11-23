@@ -11,7 +11,7 @@ from core.azure_recommender import recommend_azure_postgresql
 from core.dataset_loader import convert_df_to_excel_bytes
 from app_pages.db2_connection import connection_form
 from core.db2_jobs import get_job
-from core.db2_scope import db_breakdown, scope_view
+from core.db2_scope import database_recommendations, db_breakdown, scope_view
 
 SCOPE_KEYS = {"Schema": "schema", "Database": "database", "All databases": "instance"}
 
@@ -119,6 +119,21 @@ with st.container(border=True):
     st.caption(f"HA: {'zone-redundant' if rec['ha_enabled'] else 'standalone'}. "
                "A starting point from the measured CPU, memory, disk and IOPS.")
 
+st.markdown("**Per database (each database gets its own Azure server)**")
+st.caption("Three options per database: the same sizing at a different CPU target. "
+           "Conservative = 50%, balanced = 65% (the default above), lean = 80% peak CPU on the Azure server.")
+rows = []
+for item in database_recommendations(res, is_prod):
+    if item["options"] is None:
+        rows.append({"Database": item["database"], "Option": "", "Error": item["error"]})
+        continue
+    for label, opt in item["options"].items():
+        r_, s_ = opt["rec"], opt["rec"]["recommended_sku"]
+        rows.append({"Database": item["database"], "Option": label, "CPU target": f"{opt['target_cpu_utilization']:.0%}",
+                     "SKU": s_["sku"], "vCores": s_["vcpus"], "RAM (GiB)": s_["memory_gib"],
+                     "Storage (GiB)": r_["target_storage_gib"], "IOPS": r_["effective_iops"], "Error": ""})
+st.dataframe(pd.DataFrame(rows), hide_index=True, alt="Azure sizing options per database")
+
 sm = view["summary"]
 sampled = view["sampled"]
 has_samples = sampled is not None and len(sampled) > 0
@@ -218,20 +233,27 @@ with t_db:
             st.caption(f"Container total: {pie['value'].sum():,.2f} GB {measure.lower()} across {len(pie)} database(s).")
         else:
             st.caption("No storage to show for this measure.")
-    st.caption("One row per database. A database that could not be read keeps its error text.")
+    st.caption("One row per database. Shares are percent of the container total. Container peak CPU, IOPS and connections "
+               "are the sum of per-database peaks: an upper bound, since peaks may not coincide. "
+               "A database that could not be read keeps its error text.")
     st.dataframe(
         breakdown, hide_index=True, alt="Storage, objects and peak workload per database",
         column_config={
             "database": st.column_config.TextColumn("Database"),
             "allocated_gb": st.column_config.NumberColumn("Allocated (GB)", format="%.2f"),
             "used_gb": st.column_config.NumberColumn("Used (GB)", format="%.2f"),
+            "allocated_share_pct": st.column_config.NumberColumn("Allocated share (%)", format="%.1f"),
             "user_data_gb": st.column_config.NumberColumn("User data (GB)", format="%.3f"),
+            "bufferpool_gb": st.column_config.NumberColumn("Bufferpool (GB)", format="%.2f"),
             "tables": st.column_config.NumberColumn("Tables", format="%d"),
             "views": st.column_config.NumberColumn("Views", format="%d"),
             "routines": st.column_config.NumberColumn("Routines", format="%d"),
             "peak_cpu_pct": st.column_config.NumberColumn("Peak CPU (%)", format="%.2f"),
+            "peak_cpu_share_pct": st.column_config.NumberColumn("CPU share (%)", format="%.1f"),
             "peak_iops": st.column_config.NumberColumn("Peak IOPS", format="%.1f"),
+            "peak_iops_share_pct": st.column_config.NumberColumn("IOPS share (%)", format="%.1f"),
             "connections": st.column_config.NumberColumn("Connections", format="%d"),
+            "connections_share_pct": st.column_config.NumberColumn("Connections share (%)", format="%.1f"),
             "error": st.column_config.TextColumn("Error"),
         })
 

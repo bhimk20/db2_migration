@@ -61,6 +61,9 @@ VM_IOPS_CAP = {
 }
 HA_FAILOVER_SECONDS = "60-120"
 
+# Sizing options offered by recommend_options(): (label, target CPU utilization)
+SIZING_OPTIONS = (("conservative", 0.50), ("balanced", TARGET_CPU_UTILIZATION), ("lean", 0.80))
+
 
 def extract_domain_from_fqdn(fqdn: str) -> str:
     """Extracts domain suffix from an FQDN, or returns 'standalone' if no dots."""
@@ -136,6 +139,7 @@ def recommend_azure_postgresql(
     growth_gb_per_month: Optional[float] = None,
     peak_iops: Optional[float] = None,
     client_connections: Optional[int] = None,
+    target_cpu_utilization: float = TARGET_CPU_UTILIZATION,
 ) -> Dict[str, Any]:
     """
     Computes Azure Database for PostgreSQL Flexible Server architectural sizing recommendations.
@@ -147,13 +151,14 @@ def recommend_azure_postgresql(
     - source_engine: source database engine (informational; does not force a tier)
     - is_production: production workloads get General Purpose / Memory Optimized; non-prod gets Burstable
     - ha_override: optional explicit HA toggle (ignored for Burstable, which has no zone-redundant HA)
-    - peak_cpu_pct: optional observed peak CPU utilization (0-100). If set, vCores = vcpus * peak / 65%
+    - peak_cpu_pct: optional observed peak CPU utilization (0-100). If set, vCores = vcpus * peak / target_cpu_utilization
     - working_set_gb: optional hot working set. If set, RAM target = working set * 1.5
     - force_memory_optimized: force the Memory Optimized (E-series) tier for production
     - memory_profile: "Auto" (default), "General Purpose" (never switch to E-series) or "Memory Optimized"
     - growth_gb_per_month: expected data growth; storage is sized for 12 months of it
     - peak_iops: observed peak IOPS; provisioned at peak + 30% (VM may be bumped, extra SSD v2 IOPS bought)
     - client_connections: total app connections (instances x pool + extras); checked against max_connections
+    - target_cpu_utilization: target peak CPU utilization (0-1) used for the vCPU calc (default 0.65)
     """
     # 1. Tier selection (research: GP default; E-series only for large working sets; Burstable for non-prod)
     ratio = (ram_gb / vcpus) if vcpus > 0 else 0.0
@@ -188,8 +193,8 @@ def recommend_azure_postgresql(
     # 2. vCPU target
     min_vcpus = 1 if preferred_tier == "Burstable" else 2
     if peak_cpu_pct and peak_cpu_pct > 0 and vcpus > 0:
-        cpu_basis = f"peak CPU {peak_cpu_pct:.0f}% at {TARGET_CPU_UTILIZATION:.0%} target utilization"
-        target_vcpus = max(min_vcpus, int(math.ceil(vcpus * (peak_cpu_pct / 100.0) / TARGET_CPU_UTILIZATION)))
+        cpu_basis = f"peak CPU {peak_cpu_pct:.0f}% at {target_cpu_utilization:.0%} target utilization"
+        target_vcpus = max(min_vcpus, int(math.ceil(vcpus * (peak_cpu_pct / 100.0) / target_cpu_utilization)))
     else:
         cpu_basis = f"allocated source cores ({CPU_CORE_RATIO:.0f}:1)"
         target_vcpus = max(min_vcpus, int(math.ceil(vcpus * CPU_CORE_RATIO))) if vcpus > 0 else min_vcpus
@@ -407,9 +412,19 @@ def recommend_azure_postgresql(
             "peak_iops": peak_iops or None,
             "client_connections": client_connections or None,
             "is_production": is_production,
+            "target_cpu_utilization": target_cpu_utilization,
         },
         "reasoning": reasoning,
     }
+
+
+def recommend_options(**kwargs) -> Dict[str, Dict[str, Any]]:
+    """Runs recommend_azure_postgresql once per SIZING_OPTIONS entry; returns {label: {target_cpu_utilization, rec}}."""
+    options = {}
+    for label, utilization in SIZING_OPTIONS:
+        rec = recommend_azure_postgresql(**kwargs, target_cpu_utilization=utilization)
+        options[label] = {"target_cpu_utilization": utilization, "rec": rec}
+    return options
 
 
 def generate_azure_markdown_report(
