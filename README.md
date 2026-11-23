@@ -51,6 +51,8 @@ scripts/
   run.bat               Run from source (Windows)
   setup_gsdb.sh         Installs IBM's GSDB sample database into a Db2 container
   load_test.sh          Concurrent load inside a Db2 container (for assessment testing)
+  load_test.ps1         Same as load_test.sh, for Windows PowerShell
+  load_test.bat         Wrapper that runs load_test.ps1
   setup_gsdb.ps1        Same as setup_gsdb.sh, for Windows PowerShell
   setup_gsdb.bat        Wrapper that runs setup_gsdb.ps1
 .github/workflows/build.yml   Builds Windows and macOS executables
@@ -77,7 +79,7 @@ Two pages share one connection. **DB2 explorer** lists the tables (keys, indexes
 
 **DB2 assessment.** In the sidebar, connect to a Docker Db2 container (or over TCP with `ibm_db`). One background job reads all databases in the container, and the result stays available across page changes and restarts. Use the scope switch to view it as **Schema**, **Database** or **All databases**. Each database has a storage pie chart showing how its space is used.
 
-**Load test.** Start an assessment with a sampling window at least as long as the test, then run `scripts/load_test.sh [container] [duration_s]` (default 120 s). It runs 2 workers on SAMPLE and 6 on GS_DB (schema GOSALES) inside the container, then cleans up. In the **Databases** tab, GS_DB should show clearly higher CPU, IOPS and connections than SAMPLE.
+**Load test.** Start an assessment with a sampling window at least as long as the test, then run `scripts/load_test.sh [container] [duration_s]` (default 120 s; on Windows `scripts\load_test.bat [container] [duration_s]`). It runs 2 workers on SAMPLE and 6 on GS_DB (schema GOSALES) inside the container, then cleans up. In the **Databases** tab, GS_DB should show clearly higher CPU, IOPS and connections than SAMPLE.
 
 ## Azure sizing rules
 
