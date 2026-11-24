@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-Install IBM's GSDB (Great Outdoors Sales) sample database into a running Db2 Docker container.
+Install IBM's GSDB (Great Outdoors Sales) sample database into a running Db2 container (wslc).
 PowerShell port of setup_gsdb.sh.
 
 Everything happens inside the container: the archive is downloaded there, so nothing is copied
@@ -8,7 +8,7 @@ from the host. Existing databases (SAMPLE, TESTDB, ...) are not touched; only a 
 target name is dropped and recreated (setupGSDB.sh -createdb).
 
 Usage: scripts\setup_gsdb.bat [container] [database]   (or: powershell -File scripts\setup_gsdb.ps1 ...)
-  container  Docker container running Db2           (default: db2)
+  container  wslc container running Db2             (default: db2)
   database   Name of the database to create         (default: GS_DB)
 
 Env overrides: INSTANCE_USER (db2inst1), INSTANCE_PASSWORD (default: container's DB2INST1_PASSWORD),
@@ -29,14 +29,9 @@ $WorkDir = if ($env:WORK_DIR) { $env:WORK_DIR } else { '/database/gsdb_setup' } 
 $ArchiveUrl = if ($env:ARCHIVE_URL) { $env:ARCHIVE_URL } else { 'https://public.dhe.ibm.com/software/data/sample/GSDB_DB2_LUW_ZOS_v2r3.zip' }
 $Archive = $ArchiveUrl.Substring($ArchiveUrl.LastIndexOf('/') + 1)
 
-# Container CLI: env DB2_CONTAINER_CLI, else docker, else wslc (WSL container CLI).
-$Cli = $env:DB2_CONTAINER_CLI
-if (-not $Cli) {
-    foreach ($c in 'docker', 'wslc') {
-        if (Get-Command $c -ErrorAction SilentlyContinue) { $Cli = $c; break }
-    }
-}
-if (-not $Cli) { throw 'Neither docker nor wslc was found on PATH' }
+# Container CLI: wslc (WSL container CLI) only.
+$Cli = 'wslc'
+if (-not (Get-Command $Cli -ErrorAction SilentlyContinue)) { throw 'wslc was not found on PATH' }
 
 # Run a container CLI command with its stderr discarded; returns the output and the exit code.
 function Get-DockerOutput {
