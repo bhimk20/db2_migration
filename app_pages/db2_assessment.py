@@ -121,7 +121,8 @@ with st.container(border=True):
 
 st.markdown("**Per database (each database gets its own Azure server)**")
 st.caption("Three options per database: the same sizing at a different CPU target. "
-           "Conservative = 50%, balanced = 65% (the default above), lean = 80% peak CPU on the Azure server.")
+           "Target peak CPU is how busy the Azure server may get at the observed peak: conservative = 50% (most headroom, "
+           "more vCores), balanced = 65% (the default above), lean = 80% (least headroom, fewer vCores).")
 rows = []
 for item in database_recommendations(res, is_prod):
     if item["options"] is None:
@@ -129,10 +130,11 @@ for item in database_recommendations(res, is_prod):
         continue
     for label, opt in item["options"].items():
         r_, s_ = opt["rec"], opt["rec"]["recommended_sku"]
-        rows.append({"Database": item["database"], "Option": label, "CPU target": f"{opt['target_cpu_utilization']:.0%}",
+        rows.append({"Database": item["database"], "Option": label, "Target peak CPU": f"{opt['target_cpu_utilization']:.0%}",
                      "SKU": s_["sku"], "vCores": s_["vcpus"], "RAM (GiB)": s_["memory_gib"],
                      "Storage (GiB)": r_["target_storage_gib"], "IOPS": r_["effective_iops"], "Error": ""})
-st.dataframe(pd.DataFrame(rows), hide_index=True, alt="Azure sizing options per database")
+options_df = pd.DataFrame(rows)
+st.dataframe(options_df, hide_index=True, alt="Azure sizing options per database")
 
 sm = view["summary"]
 sampled = view["sampled"]
@@ -194,6 +196,7 @@ with t_over:
 
     export = {
         "Summary": pd.DataFrame([{"Metric": k, "Value": v} for k, v in sm.items()]),
+        "Sizing options": options_df,
         "Findings": pd.DataFrame(findings),
         "Tables": view["tables"],
         "Tablespaces": view["tablespaces"],

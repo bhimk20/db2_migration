@@ -14,31 +14,32 @@ HOW TO RUN (Windows)
   4. When the assessment finishes, open the Databases tab: GS_DB (6 workers) should show clearly
      higher CPU, IOPS and connections than SAMPLE (2 workers).
 
-  container   Docker container running Db2                  (default: db2)
+  container   wslc container running Db2                    (default: db2)
   duration_s  How long to keep the load running, in seconds (default: 120)
+  profile     steady | ramp | burst                          (default: steady)
+                steady  all workers flat out
+                ramp    workers connect one by one, evenly spread over the duration
+                burst   all connected, 30 s busy / 30 s idle (use "Seconds per sample" of 10 or less)
 
 What it does: 2 workers on SAMPLE and 6 on GS_DB (schema GOSALES). Each worker is one container
 session that connects once, then loops COUNT(*) scans of the largest tables plus inserts into a
 scratch table (LOAD_TEST_SCRATCH, created and dropped by this script). Press Ctrl+C to stop early;
 the workers are stopped and the scratch tables dropped either way.
 
-Env overrides: DB2_CONTAINER_CLI (docker or wslc), INSTANCE_USER (db2inst1).
+Container CLI: wslc only. Env override: INSTANCE_USER (db2inst1).
 #>
 param(
     [string]$Container = 'db2',
-    [int]$Duration = 120
+    [int]$Duration = 120,
+    [ValidateSet('steady', 'ramp', 'burst')][string]$Profile = 'steady'
 )
 
 $ErrorActionPreference = 'Stop'
+$BurstOn = 30; $BurstOff = 30
 $InstanceUser = if ($env:INSTANCE_USER) { $env:INSTANCE_USER } else { 'db2inst1' }
 
-$Cli = $env:DB2_CONTAINER_CLI
-if (-not $Cli) {
-    foreach ($c in 'docker', 'wslc') {
-        if (Get-Command $c -ErrorAction SilentlyContinue) { $Cli = $c; break }
-    }
-}
-if (-not $Cli) { throw 'Neither docker nor wslc was found on PATH' }
+$Cli = 'wslc'
+if (-not (Get-Command $Cli -ErrorAction SilentlyContinue)) { throw 'wslc was not found on PATH' }
 
 # Run a bash script as the instance owner inside the container. The script goes in on stdin,
 # which avoids Windows quoting problems. Returns the output lines; exit code is in $LASTEXITCODE.
@@ -66,20 +67,25 @@ function Test-ContainerRunning {
 # Up to two largest user tables matching the schema condition.
 function Get-TopTables {
     param([string]$Database, [string]$Condition)
-    $sql = "SELECT TABSCHEMA || '.' || TABNAME FROM SYSCAT.TABLES WHERE TYPE = 'T' AND $Condition ORDER BY CARD DESC FETCH FIRST 2 ROWS ONLY WITH UR"
+    $sql = "SELECT RTRIM(TABSCHEMA) || '.' || RTRIM(TABNAME) FROM SYSCAT.TABLES WHERE TYPE = 'T' AND $Condition ORDER BY CARD DESC FETCH FIRST 2 ROWS ONLY WITH UR"
     @(Invoke-Sql $Database $sql | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^[A-Za-z0-9_.]+$' })
 }
 
 # Container-side bash for one worker: one CONNECT, then scans and inserts until the end epoch.
 # The "loadtest-worker" comment lets cleanup find the processes with pkill.
 function Get-WorkerScript {
-    param([string]$Database, [int]$Id, [long]$End, [string[]]$Tables)
+    param([string]$Database, [int]$Id, [long]$End, [long]$Begin, [long]$Start, [string[]]$Tables)
     $scans = ($Tables | ForEach-Object { "echo 'SELECT COUNT(*) FROM $_ WITH UR;'; " }) -join ''
+    $gate = ''
+    if ($Profile -eq 'burst') {
+        $gate = "[ `$(( (`$(date +%s) - $Start) % $($BurstOn + $BurstOff) )) -ge $BurstOn ] && { sleep 1; continue; }; "
+    }
     @"
 # loadtest-worker $Database-$Id
+while [ `$(date +%s) -lt $Begin ]; do sleep 1; done
 { echo 'CONNECT TO $Database;'; n=0
   while [ `$(date +%s) -lt $End ]; do
-    ${scans}n=`$((n+1)); echo "INSERT INTO LOAD_TEST_SCRATCH VALUES (`$n, CURRENT TIMESTAMP);"
+    ${gate}${scans}n=`$((n+1)); echo "INSERT INTO LOAD_TEST_SCRATCH VALUES (`$n, CURRENT TIMESTAMP);"
   done
   echo 'CONNECT RESET;'; } | db2 -t >/dev/null
 "@
@@ -90,8 +96,9 @@ if (-not (Test-ContainerRunning)) { throw "Container '$Container' is not running
 
 $jobs = @()
 try {
-    $end = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + $Duration
-    Write-Host ("Start: {0} container={1} duration={2}s ({3})" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Container, $Duration, $Cli)
+    $start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $end = $start + $Duration
+    Write-Host ("Start: {0} container={1} duration={2}s profile={3} ({4})" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Container, $Duration, $Profile, $Cli)
 
     foreach ($g in @(
         @{ Db = 'SAMPLE'; Cond = "TABSCHEMA NOT LIKE 'SYS%' AND TABSCHEMA <> 'NULLID'"; Count = 2 },
@@ -101,7 +108,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Cannot use database $($g.Db) in container $Container" }
         $tables = Get-TopTables $g.Db $g.Cond
         for ($i = 1; $i -le $g.Count; $i++) {
-            $script = Get-WorkerScript $g.Db $i $end $tables
+            $begin = if ($Profile -eq 'ramp') { $start + [long][math]::Floor(($i - 1) * $Duration / $g.Count) } else { $start }
+            $script = Get-WorkerScript $g.Db $i $end $begin $start $tables
             # Each job is one `exec` session (one Db2 connection) kept open for the whole duration.
             $jobs += Start-Job -ArgumentList $Cli, $Container, $InstanceUser, $script -ScriptBlock {
                 param($cli, $container, $user, $script)

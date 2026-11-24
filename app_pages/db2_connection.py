@@ -43,10 +43,11 @@ def _instance_databases(src: Db2Source) -> Optional[list]:
 
 @st.dialog("Re-run assessment?")
 def _confirm_rerun(src: Db2Source, window_s: int) -> None:
-    st.write(f"This re-reads all databases and takes about {window_s + 60} seconds. It replaces the saved result.")
+    st.write(f"This measures the workload again and takes about {window_s} seconds. Tables, views and routines are not "
+             "re-read; use **Refresh objects** for that.")
     confirm, cancel = st.columns(2)
     if confirm.button("Re-run", type="primary", width="stretch", key="db2_rerun_confirm"):
-        start_assessment(src, databases=_instance_databases(src), force=True, **_sample_settings())
+        start_assessment(src, databases=_instance_databases(src), force=True, mode="workload", **_sample_settings())
         st.rerun()
     if cancel.button("Cancel", width="stretch", key="db2_rerun_cancel"):
         st.rerun()
@@ -75,6 +76,10 @@ def _status(src: Db2Source, job: Job, needs: str) -> None:
     if job.status == "done":
         if st.button("Re-run assessment", icon=":material/refresh:", key="db2_rerun", width="stretch"):
             _confirm_rerun(src, job.window_s)
+        if st.button("Refresh objects", icon=":material/database_search:", key="db2_refresh_objects", width="stretch",
+                     help="Re-reads tables, views, routines and sizes. Keeps the workload measured earlier."):
+            start_assessment(src, databases=_instance_databases(src), force=True, mode="objects", **_sample_settings())
+            st.rerun()
     elif st.button("Retry", icon=":material/refresh:", key="db2_rerun", width="stretch"):
         start_assessment(src, databases=_instance_databases(src), force=True, **_sample_settings())
         st.rerun()

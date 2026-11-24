@@ -102,8 +102,11 @@ def _error_text(exc: Exception) -> str:
     return (str(exc) or type(exc).__name__)[:300]
 
 
-def _run(job: Job, src: Db2Source, databases: List[str]) -> None:
-    """Phase 1 reads catalogs of all databases, phase 2 samples workload, phase 3 assembles the result.
+def _run(job: Job, src: Db2Source, databases: List[str], mode: str = "full", prior: Optional[dict] = None) -> None:
+    """`mode` "full" does every phase. "workload" reuses the catalogs of `prior` and only samples again.
+    "objects" reads the catalogs again and keeps the workload samples of `prior`.
+
+    Phase 1 reads catalogs of all databases, phase 2 samples workload, phase 3 assembles the result.
 
     A database that fails is marked with its error and the others continue. The job fails only when
     no database could be read at all.
@@ -117,10 +120,21 @@ def _run(job: Job, src: Db2Source, databases: List[str]) -> None:
             db: {"static": None, "objects": None, "sampled": None, "error": ""} for db in databases
         }
 
+        old = (prior or {}).get("databases", {})
+        if mode == "workload":
+            for db in databases:
+                o = old.get(db) or {}
+                if o.get("static") is not None:
+                    reads[db]["static"], reads[db]["objects"] = o["static"], o["objects"]
+        elif mode == "objects":
+            for db in databases:
+                reads[db]["sampled"] = (old.get(db) or {}).get("sampled")
+
         # phase 1: catalog of every database, at most 4 at once
         progress_lock = threading.Lock()
         done = 0
         job.stage, job.progress = f"Reading {n} databases (0/{n} done)", 0.05
+        todo = [db for db in databases if reads[db]["static"] is None]
 
         def read(db: str) -> None:
             nonlocal done
@@ -140,8 +154,9 @@ def _run(job: Job, src: Db2Source, databases: List[str]) -> None:
                 job.stage = f"Reading {n} databases ({done}/{n} done)"
                 job.progress = 0.05 + 0.25 * done / n
 
-        with ThreadPoolExecutor(max_workers=min(4, n)) as pool:
-            list(pool.map(read, databases))
+        if todo:
+            with ThreadPoolExecutor(max_workers=min(4, len(todo))) as pool:
+                list(pool.map(read, todo))
 
         ok = [db for db in databases if reads[db]["static"] is not None]
         if not ok:
@@ -149,7 +164,10 @@ def _run(job: Job, src: Db2Source, databases: List[str]) -> None:
             raise RuntimeError(first_error)
 
         # phase 2: workload of every readable database, in parallel, same window
-        if job.sample_on:
+        if mode == "workload" and not job.sample_on:
+            for db in ok:
+                reads[db]["sampled"] = None
+        if job.sample_on and mode != "objects":
             fractions = {db: 0.0 for db in ok}
             job.stage, job.progress = "Measuring workload (0%)", 0.30
 
@@ -187,7 +205,7 @@ def _run(job: Job, src: Db2Source, databases: List[str]) -> None:
 
 def start_assessment(src: Db2Source, databases: Optional[List[str]] = None, sample_on: bool = True,
                      interval_s: int = DEFAULT_INTERVAL_S, window_s: int = DEFAULT_WINDOW_S,
-                     force: bool = False) -> Job:
+                     force: bool = False, mode: str = "full") -> Job:
     """Start a background assessment of the instance unless one is running, or a finished one exists and `force` is off."""
     key = job_key(src)
     dbs = list(databases) if databases else [src.database]
@@ -198,9 +216,17 @@ def start_assessment(src: Db2Source, databases: Optional[List[str]] = None, samp
         if job and job.status == "done" and not force:
             _JOBS[key] = job
             return job
-        job = Job(key=key, sample_on=sample_on, interval_s=int(interval_s), window_s=int(window_s))
+        prior = job.result if (job and job.status == "done" and mode != "full") else None
+        if prior is None:
+            mode = "full"
+        new = Job(key=key, sample_on=sample_on, interval_s=int(interval_s), window_s=int(window_s))
+        if mode == "workload":
+            new.objects = dict(job.objects)  # catalogs stay visible in the explorer
+        elif mode == "objects":
+            new.sample_on, new.interval_s, new.window_s = job.sample_on, job.interval_s, job.window_s
+        job = new
         _JOBS[key] = job
     # worker gets its own copy: the password stays in memory only for the life of the run
     worker_src = Db2Source(**vars(src))
-    threading.Thread(target=_run, args=(job, worker_src, dbs), daemon=True, name=f"db2-{key}").start()
+    threading.Thread(target=_run, args=(job, worker_src, dbs, mode, prior), daemon=True, name=f"db2-{key}").start()
     return job
